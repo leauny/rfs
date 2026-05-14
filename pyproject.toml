@@ -1,13 +1,13 @@
 [project]
-name = "2026-05-13-playwright"
+name = "rfs"
 version = "0.1.0"
-description = "Add your description here"
+description = "Remote File Server - CLI and TUI client for HTTP file transfer"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "playwright>=1.59.0",
     "requests>=2.31.0",
     "click>=8.1.0",
+    "textual>=1.0.0",
 ]
 
 [project.scripts]
@@ -19,4 +19,4 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
-only-include = ["rfs.py"]
+only-include = ["rfs.py", "rfs_tui.py"]
