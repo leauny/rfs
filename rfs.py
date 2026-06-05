@@ -8,7 +8,7 @@ import click
 import requests
 
 DEFAULT_SERVER = "http://10.177.59.150:8580"
-DEFAULT_PROXY = "http://172.25.104.139:7890"
+DEFAULT_PROXY = None
 
 
 @click.group()
@@ -35,7 +35,7 @@ def cli(ctx, server, proxy, no_proxy):
     """
     ctx.ensure_object(dict)
     ctx.obj["server"] = server.rstrip("/")
-    ctx.obj["proxies"] = None if no_proxy else {"http": proxy, "https": proxy}
+    ctx.obj["proxies"] = None if no_proxy else ({"http": proxy, "https": proxy} if proxy else None)
 
 
 @cli.command()
