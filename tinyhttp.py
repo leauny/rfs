@@ -17,6 +17,17 @@ import urllib.request
 from io import BytesIO
 
 
+def normalize_url_prefix(prefix):
+    prefix = (prefix or "").strip()
+    if not prefix or prefix == "/":
+        return ""
+    if "://" in prefix or "?" in prefix or "#" in prefix:
+        raise ValueError("url prefix must be a path like /rfs")
+    if not prefix.startswith("/"):
+        prefix = "/" + prefix
+    return prefix.rstrip("/")
+
+
 class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
     """简单的http文件服务器，支持上传下载、软删除、重命名、创建目录"""
 
@@ -24,7 +35,9 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         # API endpoints
-        parsed = urllib.parse.urlparse(self.path)
+        parsed = self._parse_prefixed_path()
+        if parsed is None:
+            return self.send_error(404, "File not found")
         if parsed.path == "/_api/ls":
             return self._api_ls(parsed)
         if parsed.path == "/_api/trash":
@@ -43,7 +56,9 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             f.close()
 
     def do_POST(self):
-        parsed = urllib.parse.urlparse(self.path)
+        parsed = self._parse_prefixed_path()
+        if parsed is None:
+            return self.send_error(404, "File not found")
 
         # API endpoints (JSON body)
         if parsed.path == "/_api/mkdir":
@@ -66,7 +81,8 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         else:
             f.write(b"<strong>Failed:</strong>")
         f.write(info.encode())
-        f.write(("<br><a href=\"%s\">back</a>" % self.headers['referer']).encode())
+        back_url = self.headers.get("referer") or self._add_url_prefix(parsed.path)
+        f.write(("<br><a href=\"%s\">back</a>" % html.escape(back_url, quote=True)).encode())
         f.write(b"</body>\n</html>\n")
         length = f.tell()
         f.seek(0)
@@ -82,7 +98,10 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         """Soft-delete: move file to .Trash/ with metadata."""
-        path = self.translate_path(self.path)
+        parsed = self._parse_prefixed_path()
+        if parsed is None:
+            return self.send_error(404, "File not found")
+        path = self.translate_path(parsed.path)
         if not self._check_path_safe(path):
             return self._send_json(403, {"ok": False, "error": "Access denied: path outside serve root"})
         if not os.path.exists(path):
@@ -311,6 +330,32 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         # Allow root itself and anything under it
         return real == root or real.startswith(root + os.sep)
 
+    def _url_prefix(self):
+        return getattr(self.server, "url_prefix", "")
+
+    def _strip_url_prefix(self, path):
+        prefix = self._url_prefix()
+        if not prefix:
+            return path
+        if path == prefix:
+            return "/"
+        if path.startswith(prefix + "/"):
+            return path[len(prefix):] or "/"
+        return None
+
+    def _add_url_prefix(self, path):
+        prefix = self._url_prefix()
+        if not path.startswith("/"):
+            path = "/" + path
+        return prefix + path if prefix else path
+
+    def _parse_prefixed_path(self):
+        parsed = urllib.parse.urlparse(self.path)
+        stripped_path = self._strip_url_prefix(parsed.path)
+        if stripped_path is None:
+            return None
+        return parsed._replace(path=stripped_path)
+
     def _send_json(self, code, data):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -348,6 +393,9 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def deal_post_data(self):
         """Parse multipart upload. Returns (success, message, saved_path)."""
+        parsed = self._parse_prefixed_path()
+        if parsed is None:
+            return (False, "URL prefix does not match", None)
         content_type = self.headers['content-type']
         if not content_type:
             return (False, "Content-Type header doesn't contain boundary", None)
@@ -388,7 +436,7 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         if not fn:
             return (False, "Can't find out file name...", None)
 
-        path = self.translate_path(self.path)
+        path = self.translate_path(parsed.path)
         filepath = os.path.join(path, fn[0])
 
         try:
@@ -400,12 +448,16 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         return (True, "File '%s' upload success!" % filepath, filepath)
 
     def send_head(self):
-        path = self.translate_path(self.path)
+        parsed = self._parse_prefixed_path()
+        if parsed is None:
+            self.send_error(404, "File not found")
+            return None
+        path = self.translate_path(parsed.path)
         f = None
         if os.path.isdir(path):
-            if not self.path.endswith('/'):
+            if not parsed.path.endswith('/'):
                 self.send_response(301)
-                self.send_header("Location", self.path + "/")
+                self.send_header("Location", self._add_url_prefix(parsed.path + "/"))
                 self.end_headers()
                 return None
             for index in "index.html", "index.htm":
@@ -438,7 +490,9 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             return None
         list.sort(key=lambda a: a.lower())
         f = BytesIO()
-        displaypath = html.escape(urllib.parse.unquote(self.path))
+        parsed = self._parse_prefixed_path()
+        display_path = self._add_url_prefix(parsed.path if parsed else self.path)
+        displaypath = html.escape(urllib.parse.unquote(display_path))
         f.write(b'<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">')
         f.write(("<html>\n<title>Directory listing for %s</title>\n" % displaypath).encode())
         f.write(("<body>\n<h2>Directory listing for %s</h2>\n" % displaypath).encode())
@@ -516,13 +570,21 @@ if __name__ == '__main__':
                              '[default: all interfaces]')
     parser.add_argument('--port', '-p', default=8002, type=int,
                         help='Specify alternate port')
+    parser.add_argument('--url-prefix', default='',
+                        help='URL path prefix when served behind a reverse proxy, e.g. /rfs')
     args = parser.parse_args()
+    try:
+        url_prefix = normalize_url_prefix(args.url_prefix)
+    except ValueError as e:
+        parser.error(str(e))
 
     # Use ThreadingHTTPServer for concurrent request handling
     server = http.server.ThreadingHTTPServer(
         (args.bind, args.port), SimpleHTTPRequestHandler
     )
-    print(f"Serving on {args.bind}:{args.port} (threaded) ...")
+    server.url_prefix = url_prefix
+    prefix_text = f" with URL prefix {url_prefix}" if url_prefix else ""
+    print(f"Serving on {args.bind}:{args.port}{prefix_text} (threaded) ...")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

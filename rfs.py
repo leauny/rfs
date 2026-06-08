@@ -38,6 +38,13 @@ def cli(ctx, server, proxy, no_proxy):
     ctx.obj["proxies"] = None if no_proxy else ({"http": proxy, "https": proxy} if proxy else None)
 
 
+def _server_url(server, path):
+    """Join a server base URL with an absolute path without dropping its prefix."""
+    if not path.startswith("/"):
+        path = "/" + path
+    return server.rstrip("/") + path
+
+
 @cli.command()
 @click.argument("path", default="")
 @click.pass_context
@@ -69,7 +76,7 @@ def _list_remote_dir(server, proxies, path, show_hidden=False):
 
     # Try JSON API first
     try:
-        url = f"{server}/_api/ls"
+        url = _server_url(server, "/_api/ls")
         params = {"path": rel_path}
         if show_hidden:
             params["show_hidden"] = "1"
@@ -89,7 +96,7 @@ def _list_remote_dir(server, proxies, path, show_hidden=False):
         pass
 
     # Fallback: HTML parsing
-    url = f"{server}/{path}"
+    url = _server_url(server, path)
     if path and not url.endswith("/"):
         url += "/"
     elif not path:
@@ -128,7 +135,7 @@ def _list_remote_dir_json(server, proxies, path):
     path = path.strip("/")
     rel_path = "/" + path + "/" if path else "/"
     try:
-        url = f"{server}/_api/ls"
+        url = _server_url(server, "/_api/ls")
         resp = requests.get(url, params={"path": rel_path}, proxies=proxies, timeout=30)
         if resp.status_code == 200:
             data = resp.json()
@@ -141,21 +148,21 @@ def _list_remote_dir_json(server, proxies, path):
 
 def _remote_delete(server, proxies, remote_path):
     """Soft-delete a remote file."""
-    url = f"{server}/{remote_path.lstrip('/')}"
+    url = _server_url(server, remote_path)
     resp = requests.delete(url, proxies=proxies, timeout=30)
     return resp
 
 
 def _remote_mkdir(server, proxies, remote_path):
     """Create a remote directory."""
-    url = f"{server}/_api/mkdir"
+    url = _server_url(server, "/_api/mkdir")
     resp = requests.post(url, json={"path": remote_path}, proxies=proxies, timeout=30)
     return resp
 
 
 def _remote_rename(server, proxies, from_path, to_path):
     """Rename/move a remote file or directory."""
-    url = f"{server}/_api/rename"
+    url = _server_url(server, "/_api/rename")
     resp = requests.post(
         url, json={"from": from_path, "to": to_path}, proxies=proxies, timeout=30
     )
@@ -171,7 +178,7 @@ def _upload_with_progress(server, proxies, local_file, remote_dir, on_progress, 
     Raises ValueError on MD5 mismatch.
     """
     remote_dir = remote_dir.rstrip("/") + "/"
-    url = f"{server}{remote_dir}"
+    url = _server_url(server, remote_dir)
     filename = remote_name or os.path.basename(local_file)
     file_size = os.path.getsize(local_file)
 
@@ -243,7 +250,7 @@ def _download_with_progress(server, proxies, remote_path, local_path, on_progres
     Returns (local_path, local_md5, server_md5).
     Raises ValueError on MD5 mismatch.
     """
-    url = f"{server}/{remote_path.lstrip('/')}"
+    url = _server_url(server, remote_path)
     filename = os.path.basename(remote_path)
 
     if os.path.isdir(local_path):
@@ -314,7 +321,7 @@ def _download(server, proxies, remote_path, local_path):
     else:
         actual_path = local_path
 
-    url = f"{server}/{remote_path.lstrip('/')}"
+    url = _server_url(server, remote_path)
     resp = requests.head(url, proxies=proxies, timeout=30)
     total = int(resp.headers.get("content-length", 0)) if resp.ok else 0
 
