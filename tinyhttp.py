@@ -10,11 +10,20 @@ import os
 import posixpath
 import re
 import shutil
+import socketserver
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from io import BytesIO
+
+
+# Python 3.7+ ships ThreadingHTTPServer; build an equivalent for 3.6.
+ThreadingHTTPServer = getattr(http.server, "ThreadingHTTPServer", None)
+if ThreadingHTTPServer is None:
+    class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
 
 
 def normalize_url_prefix(prefix):
@@ -319,7 +328,7 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         """Compute MD5 hex digest of a file."""
         h = hashlib.md5()
         with open(filepath, "rb") as f:
-            while chunk := f.read(65536):
+            for chunk in iter(lambda: f.read(65536), b""):
                 h.update(chunk)
         return h.hexdigest()
 
@@ -579,7 +588,7 @@ if __name__ == '__main__':
         parser.error(str(e))
 
     # Use ThreadingHTTPServer for concurrent request handling
-    server = http.server.ThreadingHTTPServer(
+    server = ThreadingHTTPServer(
         (args.bind, args.port), SimpleHTTPRequestHandler
     )
     server.url_prefix = url_prefix
