@@ -1,13 +1,15 @@
 """rfs - Remote File Server CLI client."""
 
 import hashlib
+import mimetypes
 import os
 import re
+import uuid
 
 import click
 import requests
 
-DEFAULT_SERVER = "http://10.177.59.150:8580"
+DEFAULT_SERVER = "http://0.0.0.0:8002"
 DEFAULT_PROXY = None
 
 
@@ -104,12 +106,23 @@ def _list_remote_dir(server, proxies, path, show_hidden=False):
     try:
         resp = requests.get(url, proxies=proxies, timeout=30)
         resp.raise_for_status()
-        links = re.findall(r'<a[^>]+href="([^"]+)"[^>]*>([^<]*)</a>', resp.text)
+        # Match table-name links and legacy <li><a> links, skip the
+        # `class="parent"` breadcrumb introduced by the new listing UI.
+        links = re.findall(
+            r'<a(?![^>]*\bclass="parent")[^>]+href="([^"]+)"[^>]*>([^<]*)</a>',
+            resp.text,
+        )
         results = []
         for href, name in links:
             if href == "../" or name.strip() == "..":
                 continue
             display = name.strip() or href
+            # Strip a trailing "@" symlink marker the legacy listing appended.
+            if display.endswith("@"):
+                display = display[:-1]
+            # Skip the "↑ Parent" crumb just in case the class filter missed it.
+            if display.startswith("↑"):
+                continue
             # .Trash always hidden; other dotfiles filtered by show_hidden
             if display.rstrip("/") == ".Trash":
                 continue
@@ -163,16 +176,22 @@ def _remote_mkdir(server, proxies, remote_path):
 def _remote_rename(server, proxies, from_path, to_path):
     """Rename/move a remote file or directory."""
     url = _server_url(server, "/_api/rename")
-    resp = requests.post(
-        url, json={"from": from_path, "to": to_path}, proxies=proxies, timeout=30
-    )
+    resp = requests.post(url, json={"from": from_path, "to": to_path}, proxies=proxies, timeout=30)
     return resp
 
 
 def _upload_with_progress(server, proxies, local_file, remote_dir, on_progress, remote_name=None):
     """Upload a local file with progress callback.
 
-    on_progress(uploaded_bytes, total_bytes) is called as data is sent over network.
+    on_progress(uploaded_bytes, total_bytes) — `uploaded_bytes` counts the
+    raw file bytes pushed so far (multipart framing overhead is excluded so
+    the percentage matches the file, not the wire body). `total_bytes` is
+    the file size.
+
+    Streams the multipart body directly from disk: peak memory is one read
+    chunk (~1 MiB), independent of file size. Computes the local MD5 in the
+    same pass and verifies against the server's `X-Content-MD5` response.
+
     remote_name: optional override for the uploaded filename.
     Returns (filename, local_md5, server_md5).
     Raises ValueError on MD5 mismatch.
@@ -182,62 +201,52 @@ def _upload_with_progress(server, proxies, local_file, remote_dir, on_progress, 
     filename = remote_name or os.path.basename(local_file)
     file_size = os.path.getsize(local_file)
 
-    # Use requests to build the multipart body (correct format, compatible with proxies)
-    # then wrap it with a progress-tracking file-like object for streaming send.
-    from requests import Request, Session
+    boundary = uuid.uuid4().hex
+    bnd = boundary.encode()
+    ctype = (mimetypes.guess_type(filename)[0] or "application/octet-stream").encode()
+    safe_name = filename.encode("utf-8")
+    head = (
+        b"--" + bnd + b"\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="'
+        + safe_name + b'"\r\n'
+        b"Content-Type: " + ctype + b"\r\n\r\n"
+    )
+    tail = b"\r\n--" + bnd + b"--\r\n"
+    total_body = len(head) + file_size + len(tail)
 
-    session = Session()
-    with open(local_file, "rb") as fp:
-        req = Request("POST", url, files={"file": (filename, fp)})
-        prepared = session.prepare_request(req)
+    md5_hasher = hashlib.md5()
+    sent_file_bytes = [0]
 
-    # prepared.body is the full multipart body (bytes)
-    # prepared.headers has Content-Type with boundary and Content-Length
-    body_bytes = prepared.body if isinstance(prepared.body, bytes) else prepared.body.encode()
-    total_size = len(body_bytes)
+    def body_iter():
+        yield head
+        with open(local_file, "rb") as fp:
+            while True:
+                chunk = fp.read(1 << 20)        # 1 MiB
+                if not chunk:
+                    break
+                md5_hasher.update(chunk)
+                sent_file_bytes[0] += len(chunk)
+                on_progress(sent_file_bytes[0], file_size)
+                yield chunk
+        yield tail
 
-    class ProgressBody:
-        """File-like wrapper that reports read progress (tracks actual network send)."""
+    headers = {
+        "Content-Type": "multipart/form-data; boundary=" + boundary,
+        "Content-Length": str(total_body),
+    }
 
-        def __init__(self, data, total, callback):
-            self._data = memoryview(data) if isinstance(data, (bytes, bytearray)) else data
-            self._offset = 0
-            self._total = total
-            self._callback = callback
-
-        def read(self, size=-1):
-            if self._offset >= self._total:
-                return b""
-            if size == -1 or size is None:
-                chunk = bytes(self._data[self._offset:])
-                self._offset = self._total
-            else:
-                end = min(self._offset + size, self._total)
-                chunk = bytes(self._data[self._offset:end])
-                self._offset = end
-            if chunk:
-                self._callback(self._offset, self._total)
-            return chunk
-
-        def __len__(self):
-            return self._total
-
-    prepared.body = ProgressBody(body_bytes, total_size, on_progress)
-
-    # Set proxies on session
-    if proxies:
-        session.proxies.update(proxies)
-
-    resp = session.send(prepared, timeout=600)
+    resp = requests.post(
+        url, data=body_iter(), headers=headers,
+        proxies=proxies, timeout=600,
+    )
     resp.raise_for_status()
 
-    local_md5 = _md5_file(local_file)
+    local_md5 = md5_hasher.hexdigest()
     server_md5 = resp.headers.get("X-Content-MD5", "")
 
     if server_md5 and server_md5 != local_md5:
         raise ValueError(
-            f"MD5 mismatch for '{filename}': local={local_md5}, server={server_md5}. "
-            f"File may be corrupted on server."
+            f"MD5 mismatch for '{filename}': local={local_md5}, server={server_md5}. File may be corrupted on server."
         )
 
     return filename, local_md5, server_md5
@@ -272,10 +281,7 @@ def _download_with_progress(server, proxies, remote_path, local_path, on_progres
     local_md5 = _md5_file(local_path)
 
     if server_md5 and server_md5 != local_md5:
-        raise ValueError(
-            f"MD5 mismatch for download '{filename}': "
-            f"server={server_md5}, local={local_md5}"
-        )
+        raise ValueError(f"MD5 mismatch for download '{filename}': server={server_md5}, local={local_md5}")
 
     return local_path, local_md5, server_md5
 
@@ -289,9 +295,7 @@ def _upload(server, proxies, local_file, remote_dir, force):
         entries = _list_remote_dir(server, proxies, remote_dir.strip("/"))
         remote_files = {href.rstrip("/") for href, _ in entries}
         if filename in remote_files:
-            if not click.confirm(
-                f"Remote '{remote_dir}{filename}' already exists. Overwrite?"
-            ):
+            if not click.confirm(f"Remote '{remote_dir}{filename}' already exists. Overwrite?"):
                 click.echo("Cancelled.")
                 return
 
@@ -303,9 +307,7 @@ def _upload(server, proxies, local_file, remote_dir, force):
             bar.update(uploaded - last_reported[0])
             last_reported[0] = uploaded
 
-        _, local_md5, server_md5 = _upload_with_progress(
-            server, proxies, local_file, remote_dir, on_progress
-        )
+        _, local_md5, server_md5 = _upload_with_progress(server, proxies, local_file, remote_dir, on_progress)
 
     click.echo(f"Uploaded: {filename} -> {remote_dir}{filename}")
     if server_md5:
@@ -332,9 +334,7 @@ def _download(server, proxies, remote_path, local_path):
             bar.update(downloaded - last_reported[0])
             last_reported[0] = downloaded
 
-        _, local_md5, server_md5 = _download_with_progress(
-            server, proxies, remote_path, local_path, on_progress
-        )
+        _, local_md5, server_md5 = _download_with_progress(server, proxies, remote_path, local_path, on_progress)
 
     click.echo(f"Downloaded: {remote_path} -> {actual_path}")
     if server_md5:
@@ -365,9 +365,7 @@ def cp(ctx, src, dst, force):
     if src_remote and dst_remote:
         raise click.UsageError("Cannot copy between two remote paths.")
     if not src_remote and not dst_remote:
-        raise click.UsageError(
-            "One of src/dst must be a remote path (prefixed with ':')."
-        )
+        raise click.UsageError("One of src/dst must be a remote path (prefixed with ':').")
 
     if dst_remote:
         local_file = src

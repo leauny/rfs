@@ -57,12 +57,15 @@ rfs ui
 
 ## 特性
 
-- MD5 校验：上传/下载完成后自动比对本地与服务端 MD5
+- 流式传输：服务端和 CLI/TUI 客户端均以恒定 ~30 MB 内存上传/下载任意大小的文件，不受文件体积限制
+- 浏览器原生上传：默认页面支持拖拽多文件、实时速度/ETA 进度条、上传完成后自动刷新
+- MD5 校验：上传/下载边写边算，避免额外读盘；本地与服务端 MD5 自动比对
 - 并发传输：多个上传/下载任务同时执行，互不阻塞
 - 软删除：删除操作移至 .Trash 目录并记录元数据，支持回退
 - 重名检测：上传时检测远程同名文件/目录，提供覆盖、重命名、取消选项
 - 进度显示：实时速度、已传输/总大小、进度条
 - 路径安全：服务端防止 `../` 路径穿越
+- Python 3.6+：服务端不依赖任何第三方库，3.6 即可运行
 
 ## 配置
 
@@ -132,3 +135,21 @@ server {
 ```bash
 python3 tinyhttp.py --bind 127.0.0.1 --port 8580 --url-prefix /rfs
 ```
+
+## 测试
+
+测试套件位于 `tests/`，使用 pytest。每个测试都会启动一个真实的
+`tinyhttp.py` 子进程在临时目录里跑，覆盖：上传/下载完整链路、
+流式 multipart 解析、`X-Content-MD5` 校验、JSON API（ls / mkdir /
+rename / restore / stat / trash）、目录列表 HTML、路径穿越防御，以及客户端/服务端在大文件上传时的内存上界。
+
+```bash
+# 安装 dev 依赖（pytest）
+uv sync --dev
+
+# 运行
+uv run pytest                  # 全量
+uv run pytest -v               # 详细输出
+uv run pytest tests/test_tinyhttp_upload.py::test_full_byte_spectrum_with_fake_boundary
+```
+

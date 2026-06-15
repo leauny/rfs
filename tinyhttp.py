@@ -11,6 +11,7 @@ import posixpath
 import re
 import shutil
 import socketserver
+import string
 import time
 import urllib.error
 import urllib.parse
@@ -24,6 +25,144 @@ if ThreadingHTTPServer is None:
     class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         daemon_threads = True
         allow_reuse_address = True
+
+
+# Directory listing template. Uses string.Template to keep it readable while
+# avoiding accidental %-formatting collisions with the inlined CSS/JS.
+# `$$` in the JS escapes a literal `$` for string.Template.
+_DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>$title</title>
+<style>
+  body { font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", sans-serif; max-width: 960px; margin: 24px auto; padding: 0 16px; color: #222; }
+  h2 { font-weight: 600; margin: 0 0 4px; word-break: break-all; }
+  .crumbs { color: #888; font-size: 13px; margin-bottom: 16px; }
+  .crumbs a.parent { color: #06c; text-decoration: none; margin-left: 6px; }
+  .crumbs a.parent:hover { text-decoration: underline; }
+  .drop { border: 2px dashed #cfd4d9; border-radius: 8px; padding: 24px; text-align: center; color: #666; transition: border-color .15s, background .15s; }
+  .drop.hover { border-color: #2a7; background: #f3fbf6; color: #2a7; }
+  .drop label { color: #06c; cursor: pointer; }
+  .bar { height: 6px; background: #eee; border-radius: 3px; overflow: hidden; margin: 12px auto 0; max-width: 480px; display: none; }
+  .bar > div { height: 100%; width: 0; background: #2a7; transition: width .1s linear; }
+  .meta { font-size: 12px; color: #666; margin-top: 6px; min-height: 16px; font-variant-numeric: tabular-nums; }
+  table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #eee; }
+  th { font-weight: 500; color: #888; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  td.name a { color: #06c; text-decoration: none; }
+  td.name a:hover { text-decoration: underline; }
+  td.size, td.mtime { color: #888; font-variant-numeric: tabular-nums; white-space: nowrap; width: 1%; }
+  td.empty { color: #aaa; text-align: center; padding: 24px; }
+  tr:hover td { background: #fafafa; }
+</style>
+</head>
+<body>
+  <h2>$display_path</h2>
+  <div class="crumbs">Directory listing $parent_link</div>
+
+  <div id="drop" class="drop">
+    拖拽文件到此处，或 <label>点击选择<input id="file" type="file" multiple hidden></label>
+    <div class="bar"><div id="pb"></div></div>
+    <div id="meta" class="meta"></div>
+  </div>
+
+  <table>
+    <thead><tr><th>名称</th><th class="size">大小</th><th class="mtime">修改时间</th></tr></thead>
+    <tbody>
+      $rows
+    </tbody>
+  </table>
+
+<script>
+(function () {
+  var drop = document.getElementById('drop');
+  var input = document.getElementById('file');
+  var bar = drop.querySelector('.bar');
+  var pb = document.getElementById('pb');
+  var meta = document.getElementById('meta');
+  var queue = [], busy = false;
+
+  function fmt(n) {
+    var u = ['B', 'KB', 'MB', 'GB', 'TB'], i = 0;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return n.toFixed(i ? 1 : 0) + ' ' + u[i];
+  }
+
+  function pump() {
+    if (busy || !queue.length) return;
+    busy = true;
+    var file = queue.shift();
+    var fd = new FormData();
+    fd.append('file', file, file.name);
+
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', location.pathname, true);
+
+    var t0 = Date.now(), lastT = t0, lastL = 0;
+    bar.style.display = 'block';
+    pb.style.width = '0';
+    meta.textContent = file.name + ' · 0 / ' + fmt(file.size);
+
+    xhr.upload.onprogress = function (e) {
+      if (!e.lengthComputable) return;
+      var pct = e.loaded * 100 / e.total;
+      pb.style.width = pct.toFixed(1) + '%';
+      var now = Date.now();
+      if (now - lastT > 200) {
+        var spd = (e.loaded - lastL) * 1000 / (now - lastT);
+        var eta = spd > 0 ? (e.total - e.loaded) / spd : 0;
+        meta.textContent = file.name + ' · ' + fmt(e.loaded) + ' / ' + fmt(e.total)
+          + ' · ' + fmt(spd) + '/s · 剩余 ' + Math.ceil(eta) + 's';
+        lastT = now; lastL = e.loaded;
+      }
+    };
+    xhr.onload = function () {
+      busy = false;
+      if (xhr.status >= 200 && xhr.status < 300) {
+        var avg = file.size * 1000 / Math.max(1, Date.now() - t0);
+        pb.style.width = '100%';
+        meta.textContent = file.name + ' · 完成 · 平均 ' + fmt(avg) + '/s';
+        if (queue.length) pump();
+        else setTimeout(function () { location.reload(); }, 500);
+      } else {
+        meta.textContent = '上传失败 (' + xhr.status + '): ' + file.name;
+        pump();
+      }
+    };
+    xhr.onerror = function () {
+      busy = false;
+      meta.textContent = '网络错误：' + file.name;
+      pump();
+    };
+    xhr.send(fd);
+  }
+
+  function add(files) {
+    for (var i = 0; i < files.length; i++) queue.push(files[i]);
+    pump();
+  }
+
+  input.addEventListener('change', function () {
+    add(input.files);
+    input.value = '';
+  });
+  ['dragenter', 'dragover'].forEach(function (ev) {
+    drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.add('hover'); });
+  });
+  ['dragleave', 'drop'].forEach(function (ev) {
+    drop.addEventListener(ev, function (e) { e.preventDefault(); drop.classList.remove('hover'); });
+  });
+  drop.addEventListener('drop', function (e) {
+    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+      add(e.dataTransfer.files);
+    }
+  });
+})();
+</script>
+</body>
+</html>
+""")
 
 
 def normalize_url_prefix(prefix):
@@ -78,7 +217,7 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             return self._api_restore()
 
         # Legacy file upload (multipart form)
-        r, info, saved_path = self.deal_post_data()
+        r, info, saved_path, md5_hex = self.deal_post_data()
         print((r, info, "by: ", self.client_address))
         f = BytesIO()
         f.write(b'<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">')
@@ -98,8 +237,8 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-type", "text/html")
         self.send_header("Content-Length", str(length))
-        if r and saved_path:
-            self.send_header("X-Content-MD5", self._md5_file(saved_path))
+        if r and md5_hex:
+            self.send_header("X-Content-MD5", md5_hex)
         self.end_headers()
         if f:
             self.copyfile(f, self.wfile)
@@ -401,60 +540,129 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
     # ─── Original Methods ──────────────────────────────────────────────────────
 
     def deal_post_data(self):
-        """Parse multipart upload. Returns (success, message, saved_path)."""
+        """Streaming multipart upload parser.
+
+        Reads the request body in fixed-size chunks, locating the part
+        headers and the closing `\\r\\n--boundary` marker without ever
+        holding the full body in memory. Writes the file content directly
+        and computes MD5 on the fly. Returns
+        `(ok, message, saved_path, md5_hex)`; `md5_hex` is None on failure.
+        """
         parsed = self._parse_prefixed_path()
         if parsed is None:
-            return (False, "URL prefix does not match", None)
-        content_type = self.headers['content-type']
-        if not content_type:
-            return (False, "Content-Type header doesn't contain boundary", None)
-        boundary = content_type.split("=")[1].encode()
-        content_length = int(self.headers['content-length'])
+            return (False, "URL prefix does not match", None, None)
+        content_type = self.headers.get('content-type', '')
+        if not content_type or 'boundary=' not in content_type:
+            return (False, "Content-Type header doesn't contain boundary", None, None)
+        boundary = content_type.split('boundary=', 1)[1].strip().encode()
+        if boundary.startswith(b'"') and boundary.endswith(b'"'):
+            boundary = boundary[1:-1]
+        sep = b'--' + boundary
+        end_sep = b'\r\n' + sep             # marker that closes the file part
+        try:
+            content_length = int(self.headers.get('content-length', 0))
+        except ValueError:
+            return (False, "Invalid Content-Length", None, None)
 
-        # Read entire body at once to avoid binary data corruption from readline
-        body = self.rfile.read(content_length)
+        READ = 1 << 20                      # 1 MiB per recv (safe on macOS)
+        remaining = [content_length]        # mutable so the helper can update
 
-        # Find boundary markers
-        bound = b"--" + boundary
-        parts = body.split(bound)
-        # parts[0] is empty (before first boundary)
-        # parts[1] is the file part
-        # parts[2] is the closing "--\r\n"
-        if len(parts) < 2:
-            return (False, "Content NOT begin with boundary", None)
+        def read_some(n):
+            n = min(n, remaining[0])
+            if n <= 0:
+                return b''
+            data = self.rfile.read(n)
+            if data:
+                remaining[0] -= len(data)
+            return data
 
-        file_part = parts[1]
-        # Strip leading \r\n
-        if file_part.startswith(b"\r\n"):
-            file_part = file_part[2:]
+        # ─── Phase 1: locate the first boundary and the part-header terminator
+        buf = b''
+        after_sep_len = 0
+        header_end = -1
+        HEADER_LIMIT = 65536
+        while True:
+            chunk = read_some(READ)
+            if not chunk:
+                return (False, "Client disconnected before headers", None, None)
+            buf += chunk
+            if buf.startswith(sep):
+                after_sep_len = len(sep)
+            elif buf.startswith(b'\r\n' + sep):
+                after_sep_len = len(sep) + 2
+            else:
+                idx = buf.find(sep)
+                if idx == -1:
+                    if len(buf) > HEADER_LIMIT:
+                        return (False, "Boundary not found in preamble", None, None)
+                    continue
+                buf = buf[idx:]
+                after_sep_len = len(sep)
+            hdr_idx = buf.find(b'\r\n\r\n', after_sep_len)
+            if hdr_idx != -1:
+                header_end = hdr_idx
+                break
+            if len(buf) > HEADER_LIMIT:
+                return (False, "Multipart headers too large", None, None)
 
-        # Split headers from content (separated by \r\n\r\n)
-        header_end = file_part.find(b"\r\n\r\n")
-        if header_end == -1:
-            return (False, "Malformed multipart data", None)
-
-        headers_section = file_part[:header_end].decode("utf-8", errors="replace")
-        file_data = file_part[header_end + 4:]
-
-        # Remove trailing \r\n before next boundary
-        if file_data.endswith(b"\r\n"):
-            file_data = file_data[:-2]
-
-        # Extract filename
-        fn = re.findall(r'Content-Disposition.*name="file"; filename="(.*)"', headers_section)
-        if not fn:
-            return (False, "Can't find out file name...", None)
+        headers_section = buf[after_sep_len:header_end].decode('utf-8', errors='replace')
+        headers_section = headers_section.lstrip('\r\n')
+        fn = re.findall(r'filename="([^"]*)"', headers_section)
+        if not fn or not fn[0]:
+            return (False, "Can't find out file name...", None, None)
 
         path = self.translate_path(parsed.path)
         filepath = os.path.join(path, fn[0])
 
-        try:
-            with open(filepath, 'wb') as out:
-                out.write(file_data)
-        except IOError:
-            return (False, "Can't create file to write, do you have permission to write?", None)
+        # ─── Phase 2: stream the body to disk, hashing on the fly
+        leftover = buf[header_end + 4:]
+        del buf
+        h = hashlib.md5()
+        # Always keep at least len(end_sep)+4 bytes back so a boundary that
+        # straddles two reads is never accidentally written to the file.
+        tail_keep = len(end_sep) + 4
 
-        return (True, "File '%s' upload success!" % filepath, filepath)
+        try:
+            out = open(filepath, 'wb')
+        except IOError:
+            return (False, "Can't create file to write, do you have permission to write?", None, None)
+
+        try:
+            with out:
+                window = leftover
+                while True:
+                    idx = window.find(end_sep)
+                    if idx != -1:
+                        out.write(window[:idx])
+                        h.update(window[:idx])
+                        break
+                    if len(window) > tail_keep:
+                        flush = window[:-tail_keep]
+                        out.write(flush)
+                        h.update(flush)
+                        window = window[-tail_keep:]
+                    if remaining[0] <= 0:
+                        # Stream exhausted without finding the closing boundary;
+                        # flush whatever's left (best-effort, rare for valid clients).
+                        if window:
+                            out.write(window)
+                            h.update(window)
+                        break
+                    chunk = read_some(READ)
+                    if not chunk:
+                        if window:
+                            out.write(window)
+                            h.update(window)
+                        break
+                    window += chunk
+        except IOError as e:
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
+            return (False, "Write failed: %s" % e, None, None)
+
+        return (True, "File '%s' upload success!" % filepath, filepath, h.hexdigest())
 
     def send_head(self):
         parsed = self._parse_prefixed_path()
@@ -493,43 +701,77 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
 
     def list_directory(self, path):
         try:
-            list = os.listdir(path)
+            names = os.listdir(path)
         except os.error:
             self.send_error(404, "No permission to list directory")
             return None
-        list.sort(key=lambda a: a.lower())
-        f = BytesIO()
+        names.sort(key=lambda a: a.lower())
+
         parsed = self._parse_prefixed_path()
-        display_path = self._add_url_prefix(parsed.path if parsed else self.path)
+        rel_path = parsed.path if parsed else "/"
+        display_path = self._add_url_prefix(rel_path)
         displaypath = html.escape(urllib.parse.unquote(display_path))
-        f.write(b'<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 3.2 Final//EN">')
-        f.write(("<html>\n<title>Directory listing for %s</title>\n" % displaypath).encode())
-        f.write(("<body>\n<h2>Directory listing for %s</h2>\n" % displaypath).encode())
-        f.write(b"<hr>\n")
-        f.write(b"<form ENCTYPE=\"multipart/form-data\" method=\"post\">")
-        f.write(b"<input name=\"file\" type=\"file\"/>")
-        f.write(b"<input type=\"submit\" value=\"upload\"/></form>\n")
-        f.write(b"<hr>\n<ul>\n")
-        for name in list:
+
+        # Parent link (None at root)
+        parent_href = None
+        if rel_path not in ("/", ""):
+            parent_rel = posixpath.normpath(rel_path.rstrip("/") + "/..")
+            if not parent_rel.endswith("/"):
+                parent_rel += "/"
+            parent_href = html.escape(self._add_url_prefix(parent_rel), quote=True)
+
+        rows = []
+        for name in names:
             if name == ".Trash":
                 continue
             fullname = os.path.join(path, name)
-            displayname = linkname = name
-            if os.path.isdir(fullname):
-                displayname = name + "/"
-                linkname = name + "/"
-            if os.path.islink(fullname):
-                displayname = name + "@"
-            f.write(('<li><a href="%s">%s</a>\n'
-                     % (urllib.parse.quote(linkname), html.escape(displayname))).encode())
-        f.write(b"</ul>\n<hr>\n</body>\n</html>\n")
-        length = f.tell()
-        f.seek(0)
+            is_dir = os.path.isdir(fullname)
+            is_link = os.path.islink(fullname)
+            linkname = name + "/" if is_dir else name
+            displayname = linkname + ("@" if is_link else "")
+            try:
+                st = os.stat(fullname)
+                mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(st.st_mtime))
+                size_str = "—" if is_dir else self._format_size(st.st_size)
+            except OSError:
+                mtime = "—"
+                size_str = "—"
+            href = html.escape(urllib.parse.quote(linkname), quote=True)
+            rows.append(
+                '<tr><td class="name"><a href="%s">%s</a></td>'
+                '<td class="size">%s</td><td class="mtime">%s</td></tr>'
+                % (href, html.escape(displayname), size_str, mtime)
+            )
+
+        parent_html = (
+            '<a class="parent" href="%s">↑ Parent</a>' % parent_href
+            if parent_href else ""
+        )
+
+        body = _DIR_TEMPLATE.substitute(
+            title=displaypath,
+            display_path=displaypath,
+            parent_link=parent_html,
+            rows="\n      ".join(rows) if rows
+                 else '<tr><td colspan="3" class="empty">— 空目录 —</td></tr>',
+        ).encode("utf-8")
+
         self.send_response(200)
-        self.send_header("Content-type", "text/html")
-        self.send_header("Content-Length", str(length))
+        self.send_header("Content-type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        f = BytesIO(body)
         return f
+
+    @staticmethod
+    def _format_size(n):
+        units = ("B", "KB", "MB", "GB", "TB")
+        i = 0
+        size = float(n)
+        while size >= 1024 and i < len(units) - 1:
+            size /= 1024
+            i += 1
+        return ("%.1f %s" if i else "%d %s") % (size, units[i])
 
     def translate_path(self, path):
         path = path.split('?', 1)[0]
