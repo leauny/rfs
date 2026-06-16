@@ -64,6 +64,31 @@ def test_upload_remote_name_override(server, tmp_path):
     assert not server.server_path("local-name.bin").exists()
 
 
+def test_upload_rejects_existing_remote_file_by_default(server, tmp_path):
+    src = tmp_path / "same.bin"
+    src.write_bytes(b"new")
+    server.server_path("same.bin").write_bytes(b"old")
+
+    with pytest.raises(rfs.requests.HTTPError):
+        rfs._upload_with_progress(server.url, None, str(src), "/", lambda *_: None)
+
+    assert server.server_path("same.bin").read_bytes() == b"old"
+
+
+def test_upload_overwrites_existing_remote_file_when_requested(server, tmp_path):
+    src = tmp_path / "same.bin"
+    src.write_bytes(b"new")
+    server.server_path("same.bin").write_bytes(b"old")
+
+    _, local_md5, server_md5 = rfs._upload_with_progress(
+        server.url, None, str(src), "/", lambda *_: None, overwrite=True
+    )
+
+    assert local_md5 == _md5_bytes(b"new")
+    assert server_md5 == local_md5
+    assert server.server_path("same.bin").read_bytes() == b"new"
+
+
 def test_upload_md5_mismatch_detection(server, tmp_path, monkeypatch):
     """If server reports a different MD5 we must raise ValueError."""
     src = tmp_path / "mm.bin"

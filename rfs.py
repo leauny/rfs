@@ -180,7 +180,7 @@ def _remote_rename(server, proxies, from_path, to_path):
     return resp
 
 
-def _upload_with_progress(server, proxies, local_file, remote_dir, on_progress, remote_name=None):
+def _upload_with_progress(server, proxies, local_file, remote_dir, on_progress, remote_name=None, overwrite=False):
     """Upload a local file with progress callback.
 
     on_progress(uploaded_bytes, total_bytes) — `uploaded_bytes` counts the
@@ -193,11 +193,14 @@ def _upload_with_progress(server, proxies, local_file, remote_dir, on_progress, 
     same pass and verifies against the server's `X-Content-MD5` response.
 
     remote_name: optional override for the uploaded filename.
+    overwrite: allow replacing an existing remote file with the same name.
     Returns (filename, local_md5, server_md5).
     Raises ValueError on MD5 mismatch.
     """
     remote_dir = remote_dir.rstrip("/") + "/"
     url = _server_url(server, remote_dir)
+    if overwrite:
+        url += "?overwrite=1"
     filename = remote_name or os.path.basename(local_file)
     file_size = os.path.getsize(local_file)
 
@@ -291,13 +294,18 @@ def _upload(server, proxies, local_file, remote_dir, force):
     remote_dir = remote_dir.rstrip("/") + "/"
     filename = os.path.basename(local_file)
 
-    if not force:
-        entries = _list_remote_dir(server, proxies, remote_dir.strip("/"))
-        remote_files = {href.rstrip("/") for href, _ in entries}
-        if filename in remote_files:
+    overwrite = force
+    entries = _list_remote_dir(server, proxies, remote_dir.strip("/"))
+    remote_entries = {href.rstrip("/"): href.endswith("/") for href, _ in entries}
+    if filename in remote_entries:
+        if remote_entries[filename]:
+            click.echo(f"Error: remote directory '{remote_dir}{filename}' already exists.", err=True)
+            return
+        if not force:
             if not click.confirm(f"Remote '{remote_dir}{filename}' already exists. Overwrite?"):
                 click.echo("Cancelled.")
                 return
+            overwrite = True
 
     file_size = os.path.getsize(local_file)
     with click.progressbar(length=file_size, label=f"Uploading {filename}") as bar:
@@ -307,7 +315,9 @@ def _upload(server, proxies, local_file, remote_dir, force):
             bar.update(uploaded - last_reported[0])
             last_reported[0] = uploaded
 
-        _, local_md5, server_md5 = _upload_with_progress(server, proxies, local_file, remote_dir, on_progress)
+        _, local_md5, server_md5 = _upload_with_progress(
+            server, proxies, local_file, remote_dir, on_progress, overwrite=overwrite
+        )
 
     click.echo(f"Uploaded: {filename} -> {remote_dir}{filename}")
     if server_md5:

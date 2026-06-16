@@ -11,3 +11,4 @@ wheels/
 
 # OS generated files
 .DS_Store
+.ace-tool/

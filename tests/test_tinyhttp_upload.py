@@ -32,8 +32,10 @@ def _build_multipart(filename, payload, boundary=None):
     return boundary, head + payload + tail
 
 
-def _post_multipart(url, filename, payload):
+def _post_multipart(url, filename, payload, overwrite=False):
     boundary, body = _build_multipart(filename, payload)
+    if overwrite:
+        url += "?overwrite=1"
     return requests.post(
         url,
         data=body,
@@ -95,6 +97,28 @@ def test_upload_into_subdir(server):
     resp = _post_multipart(server.url + "/nested/deeply/", "file.bin", payload)
     assert resp.status_code == 200
     assert (sub / "file.bin").read_bytes() == payload
+
+
+def test_upload_rejects_existing_file_without_overwrite(server):
+    server.server_path("same.bin").write_bytes(b"old")
+    resp = _post_multipart(server.url + "/", "same.bin", b"new")
+    assert resp.status_code == 409
+    assert server.server_path("same.bin").read_bytes() == b"old"
+
+
+def test_upload_overwrites_existing_file_when_requested(server):
+    server.server_path("same.bin").write_bytes(b"old")
+    resp = _post_multipart(server.url + "/", "same.bin", b"new", overwrite=True)
+    assert resp.status_code == 200
+    assert resp.headers["X-Content-MD5"] == _md5(b"new")
+    assert server.server_path("same.bin").read_bytes() == b"new"
+
+
+def test_upload_rejects_directory_name_conflict(server):
+    server.server_path("same.bin").mkdir()
+    resp = _post_multipart(server.url + "/", "same.bin", b"new", overwrite=True)
+    assert resp.status_code == 409
+    assert server.server_path("same.bin").is_dir()
 
 
 def test_directory_listing_html_contains_modern_markup(server):

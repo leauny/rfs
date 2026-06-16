@@ -47,6 +47,11 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   .bar { height: 6px; background: #eee; border-radius: 3px; overflow: hidden; margin: 12px auto 0; max-width: 480px; display: none; }
   .bar > div { height: 100%; width: 0; background: #2a7; transition: width .1s linear; }
   .meta { font-size: 12px; color: #666; margin-top: 6px; min-height: 16px; font-variant-numeric: tabular-nums; }
+  dialog { border: 1px solid #ccd2d8; border-radius: 8px; padding: 18px; box-shadow: 0 8px 30px rgba(0,0,0,.18); min-width: 320px; }
+  dialog::backdrop { background: rgba(0,0,0,.25); }
+  dialog p { margin: 0 0 12px; }
+  dialog input { box-sizing: border-box; width: 100%; padding: 6px 8px; margin-bottom: 12px; }
+  .actions { display: flex; justify-content: flex-end; gap: 8px; }
   table { width: 100%; border-collapse: collapse; margin-top: 20px; }
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #eee; }
   th { font-weight: 500; color: #888; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
@@ -67,6 +72,16 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
     <div id="meta" class="meta"></div>
   </div>
 
+  <dialog id="conflict">
+    <p id="conflict-msg"></p>
+    <input id="rename" autocomplete="off">
+    <div class="actions">
+      <button id="overwrite" type="button">Overwrite</button>
+      <button id="rename-btn" type="button">Rename</button>
+      <button id="cancel" type="button">Cancel</button>
+    </div>
+  </dialog>
+
   <table>
     <thead><tr><th>名称</th><th class="size">大小</th><th class="mtime">修改时间</th></tr></thead>
     <tbody>
@@ -81,7 +96,13 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   var bar = drop.querySelector('.bar');
   var pb = document.getElementById('pb');
   var meta = document.getElementById('meta');
-  var queue = [], busy = false;
+  var dialog = document.getElementById('conflict');
+  var conflictMsg = document.getElementById('conflict-msg');
+  var renameInput = document.getElementById('rename');
+  var overwriteBtn = document.getElementById('overwrite');
+  var renameBtn = document.getElementById('rename-btn');
+  var cancelBtn = document.getElementById('cancel');
+  var queue = [], busy = false, remoteEntries = null;
 
   function fmt(n) {
     var u = ['B', 'KB', 'MB', 'GB', 'TB'], i = 0;
@@ -89,20 +110,35 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
     return n.toFixed(i ? 1 : 0) + ' ' + u[i];
   }
 
+  function apiUrl(path) {
+    var prefix = '$url_prefix';
+    return (prefix || '') + path;
+  }
+
+  function remotePath() {
+    var prefix = '$url_prefix';
+    var path = location.pathname;
+    if (prefix && path.indexOf(prefix + '/') === 0) return path.slice(prefix.length) || '/';
+    if (prefix && path === prefix) return '/';
+    return path;
+  }
+
   function pump() {
     if (busy || !queue.length) return;
     busy = true;
-    var file = queue.shift();
+    var item = queue.shift();
+    var file = item.file;
+    var uploadName = item.name || file.name;
     var fd = new FormData();
-    fd.append('file', file, file.name);
+    fd.append('file', file, uploadName);
 
     var xhr = new XMLHttpRequest();
-    xhr.open('POST', location.pathname, true);
+    xhr.open('POST', location.pathname + (item.overwrite ? '?overwrite=1' : ''), true);
 
     var t0 = Date.now(), lastT = t0, lastL = 0;
     bar.style.display = 'block';
     pb.style.width = '0';
-    meta.textContent = file.name + ' · 0 / ' + fmt(file.size);
+    meta.textContent = uploadName + ' · 0 / ' + fmt(file.size);
 
     xhr.upload.onprogress = function (e) {
       if (!e.lengthComputable) return;
@@ -112,7 +148,7 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
       if (now - lastT > 200) {
         var spd = (e.loaded - lastL) * 1000 / (now - lastT);
         var eta = spd > 0 ? (e.total - e.loaded) / spd : 0;
-        meta.textContent = file.name + ' · ' + fmt(e.loaded) + ' / ' + fmt(e.total)
+        meta.textContent = uploadName + ' · ' + fmt(e.loaded) + ' / ' + fmt(e.total)
           + ' · ' + fmt(spd) + '/s · 剩余 ' + Math.ceil(eta) + 's';
         lastT = now; lastL = e.loaded;
       }
@@ -121,26 +157,92 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
       busy = false;
       if (xhr.status >= 200 && xhr.status < 300) {
         var avg = file.size * 1000 / Math.max(1, Date.now() - t0);
+        var md5 = xhr.getResponseHeader('X-Content-MD5');
         pb.style.width = '100%';
-        meta.textContent = file.name + ' · 完成 · 平均 ' + fmt(avg) + '/s';
+        meta.textContent = uploadName + ' · 完成 · 平均 ' + fmt(avg) + '/s' + (md5 ? ' · MD5 ' + md5 : '');
         if (queue.length) pump();
         else setTimeout(function () { location.reload(); }, 500);
       } else {
-        meta.textContent = '上传失败 (' + xhr.status + '): ' + file.name;
+        meta.textContent = '上传失败 (' + xhr.status + '): ' + uploadName;
         pump();
       }
     };
     xhr.onerror = function () {
       busy = false;
-      meta.textContent = '网络错误：' + file.name;
+      meta.textContent = '网络错误：' + uploadName;
       pump();
     };
     xhr.send(fd);
   }
 
+  function loadRemoteEntries(cb) {
+    if (remoteEntries) { cb(remoteEntries); return; }
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', apiUrl('/_api/ls') + '?path=' + encodeURIComponent(remotePath()), true);
+    xhr.onload = function () {
+      var entries = {};
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          var data = JSON.parse(xhr.responseText);
+          if (data.ok) data.entries.forEach(function (entry) { entries[entry.name] = entry.type === 'dir'; });
+        } catch (e) {}
+      }
+      remoteEntries = entries;
+      cb(entries);
+    };
+    xhr.onerror = function () { remoteEntries = {}; cb(remoteEntries); };
+    xhr.send();
+  }
+
+  function resolveConflict(file, entries, cb) {
+    if (!Object.prototype.hasOwnProperty.call(entries, file.name)) {
+      cb({ file: file, name: file.name, overwrite: false });
+      return;
+    }
+    var isDir = entries[file.name];
+    conflictMsg.textContent = isDir
+      ? "Remote directory '" + file.name + "' has the same name. Cannot overwrite."
+      : "Remote file '" + file.name + "' already exists.";
+    renameInput.value = file.name;
+    overwriteBtn.style.display = isDir ? 'none' : '';
+    function done(result) {
+      overwriteBtn.onclick = renameBtn.onclick = cancelBtn.onclick = dialog.oncancel = null;
+      dialog.close();
+      cb(result);
+    }
+    overwriteBtn.onclick = function () { done({ file: file, name: file.name, overwrite: true }); };
+    renameBtn.onclick = function () {
+      var name = renameInput.value.trim();
+      if (!name || name === file.name) {
+        meta.textContent = '请输入不同的文件名';
+        return;
+      }
+      if (Object.prototype.hasOwnProperty.call(remoteEntries || {}, name)) {
+        meta.textContent = "Remote '" + name + "' already exists";
+        return;
+      }
+      done({ file: file, name: name, overwrite: false });
+    };
+    cancelBtn.onclick = function () { done(null); };
+    dialog.oncancel = function (e) { e.preventDefault(); done(null); };
+    dialog.showModal();
+  }
+
   function add(files) {
-    for (var i = 0; i < files.length; i++) queue.push(files[i]);
-    pump();
+    loadRemoteEntries(function (entries) {
+      var list = Array.prototype.slice.call(files);
+      function next() {
+        if (!list.length) { pump(); return; }
+        resolveConflict(list.shift(), entries, function (item) {
+          if (item) {
+            queue.push(item);
+            entries[item.name] = false;
+          }
+          next();
+        });
+      }
+      next();
+    });
   }
 
   input.addEventListener('change', function () {
@@ -234,7 +336,7 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         f.write(b"</body>\n</html>\n")
         length = f.tell()
         f.seek(0)
-        self.send_response(200)
+        self.send_response(200 if r else (409 if info in ("File already exists", "A directory with this name already exists") else 400))
         self.send_header("Content-type", "text/html")
         self.send_header("Content-Length", str(length))
         if r and md5_hex:
@@ -610,9 +712,18 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         fn = re.findall(r'filename="([^"]*)"', headers_section)
         if not fn or not fn[0]:
             return (False, "Can't find out file name...", None, None)
+        filename = os.path.basename(fn[0])
+        if not filename:
+            return (False, "Can't find out file name...", None, None)
 
         path = self.translate_path(parsed.path)
-        filepath = os.path.join(path, fn[0])
+        filepath = os.path.join(path, filename)
+        params = urllib.parse.parse_qs(parsed.query)
+        overwrite = params.get("overwrite", ["0"])[0] == "1"
+        if os.path.isdir(filepath):
+            return (False, "A directory with this name already exists", None, None)
+        if os.path.exists(filepath) and not overwrite:
+            return (False, "File already exists", None, None)
 
         # ─── Phase 2: stream the body to disk, hashing on the fly
         leftover = buf[header_end + 4:]
@@ -752,6 +863,7 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             title=displaypath,
             display_path=displaypath,
             parent_link=parent_html,
+            url_prefix=self._url_prefix(),
             rows="\n      ".join(rows) if rows
                  else '<tr><td colspan="3" class="empty">— 空目录 —</td></tr>',
         ).encode("utf-8")

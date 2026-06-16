@@ -642,7 +642,7 @@ class RfsApp(App):
         if result == "cancel":
             self._process_next_upload()
         elif result == "overwrite":
-            self._start_upload(local_file)
+            self._start_upload(local_file, overwrite=True)
             self._process_next_upload()
         else:
             # result is the new filename — upload with rename
@@ -725,7 +725,7 @@ class RfsApp(App):
                 self._active_tasks.remove(task_id)
 
     @work(thread=True)
-    def _start_upload(self, local_file: str, rename_to: str | None = None) -> None:
+    def _start_upload(self, local_file: str, rename_to: str | None = None, overwrite: bool = False) -> None:
         filename = rename_to or os.path.basename(local_file)
         task_id, display_id = self._next_task_id()
 
@@ -761,7 +761,7 @@ class RfsApp(App):
         try:
             _, local_md5, server_md5 = _upload_with_progress(
                 self.server, self.proxies, local_file, remote_dir, on_progress,
-                remote_name=rename_to,
+                remote_name=rename_to, overwrite=overwrite,
             )
             elapsed = time.monotonic() - start_time
             total_size = os.path.getsize(local_file)
