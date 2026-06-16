@@ -58,6 +58,17 @@ def test_mkdir_conflict(server):
     assert resp.json()["ok"] is False
 
 
+def test_mkdir_rejects_unsafe_path_segments(server):
+    for path in ("/../escape", "/safe/./name", "/safe/../../escape", "\\escape"):
+        resp = requests.post(server.url + "/_api/mkdir", json={"path": path})
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["ok"] is False
+        assert data["error"] == "Invalid directory path"
+    assert not server.server_path("escape").exists()
+    assert not server.server_path("safe").exists()
+
+
 def test_rename(server):
     server.server_path("a.txt").write_bytes(b"A")
     resp = requests.post(

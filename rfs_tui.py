@@ -52,6 +52,11 @@ def _fmt_size(n: int) -> str:
         return f"{n / 1024 / 1024 / 1024:.2f} GB"
 
 
+def _is_invalid_dir_name(name: str) -> bool:
+    """Return True when a TUI-created directory name is unsafe."""
+    return name in (".", "..") or "/" in name or "\\" in name
+
+
 def _fmt_speed(bps: float) -> str:
     """Format bytes/sec to human-readable speed."""
     if bps < 1024:
@@ -538,6 +543,9 @@ class RfsApp(App):
 
     def _handle_mkdir(self, name: str | None) -> None:
         if not name:
+            return
+        if _is_invalid_dir_name(name):
+            self.notify("Directory name cannot be '.', '..', or contain path separators", severity="warning")
             return
         remote_path = self.current_path.rstrip("/") + "/" + name
         self._do_mkdir(remote_path)

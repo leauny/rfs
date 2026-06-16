@@ -41,6 +41,9 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   .crumbs { color: #888; font-size: 13px; margin-bottom: 16px; }
   .crumbs a.parent { color: #06c; text-decoration: none; margin-left: 6px; }
   .crumbs a.parent:hover { text-decoration: underline; }
+  .toolbar { display: flex; justify-content: flex-end; margin-bottom: 12px; }
+  .toolbar button { border: 1px solid #ccd2d8; border-radius: 6px; background: #fff; padding: 6px 10px; cursor: pointer; }
+  .toolbar button:hover { background: #f6f8fa; }
   .drop { border: 2px dashed #cfd4d9; border-radius: 8px; padding: 24px; text-align: center; color: #666; transition: border-color .15s, background .15s; }
   .drop.hover { border-color: #2a7; background: #f3fbf6; color: #2a7; }
   .drop label { color: #06c; cursor: pointer; }
@@ -65,6 +68,7 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
 <body>
   <h2>$display_path</h2>
   <div class="crumbs">Directory listing $parent_link</div>
+  <div class="toolbar"><button id="mkdir" type="button">新建文件夹</button></div>
 
   <div id="drop" class="drop">
     拖拽文件到此处，或 <label>点击选择<input id="file" type="file" multiple hidden></label>
@@ -93,6 +97,7 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
 (function () {
   var drop = document.getElementById('drop');
   var input = document.getElementById('file');
+  var mkdirBtn = document.getElementById('mkdir');
   var bar = drop.querySelector('.bar');
   var pb = document.getElementById('pb');
   var meta = document.getElementById('meta');
@@ -194,6 +199,54 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
     xhr.send();
   }
 
+  function joinRemotePath(name) {
+    var base = remotePath();
+    if (base.charAt(base.length - 1) !== '/') base += '/';
+    return base + name;
+  }
+
+  function createDirectory() {
+    var name = prompt('新建文件夹名称：');
+    if (name === null) return;
+    name = name.trim();
+    if (!name) {
+      meta.textContent = '请输入文件夹名称';
+      alert('请输入文件夹名称');
+      return;
+    }
+    if (name === '.' || name === '..') {
+      meta.textContent = '文件夹名称不能是 . 或 ..';
+      alert('文件夹名称不能是 . 或 ..');
+      return;
+    }
+    if (name.indexOf('/') !== -1 || name.indexOf('\\\\') !== -1) {
+      meta.textContent = '文件夹名称不能包含路径分隔符';
+      alert('文件夹名称不能包含路径分隔符');
+      return;
+    }
+    if (Object.prototype.hasOwnProperty.call(remoteEntries || {}, name)) {
+      meta.textContent = "Remote '" + name + "' already exists";
+      alert("Remote '" + name + "' already exists");
+      return;
+    }
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', apiUrl('/_api/mkdir'), true);
+    xhr.setRequestHeader('Content-Type', 'application/json; charset=utf-8');
+    xhr.onload = function () {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        if (remoteEntries) remoteEntries[name] = true;
+        meta.textContent = '已创建文件夹：' + name;
+        setTimeout(function () { location.reload(); }, 300);
+      } else {
+        var err = '创建文件夹失败 (' + xhr.status + ')';
+        try { err += ': ' + (JSON.parse(xhr.responseText).error || ''); } catch (e) {}
+        meta.textContent = err;
+      }
+    };
+    xhr.onerror = function () { meta.textContent = '创建文件夹网络错误：' + name; };
+    xhr.send(JSON.stringify({ path: joinRemotePath(name) }));
+  }
+
   function resolveConflict(file, entries, cb) {
     if (!Object.prototype.hasOwnProperty.call(entries, file.name)) {
       cb({ file: file, name: file.name, overwrite: false });
@@ -245,6 +298,7 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
     });
   }
 
+  mkdirBtn.addEventListener('click', createDirectory);
   input.addEventListener('change', function () {
     add(input.files);
     input.value = '';
@@ -472,6 +526,8 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         rel_path = data.get("path", "")
         if not rel_path:
             return self._send_json(400, {"ok": False, "error": "path required"})
+        if self._path_has_unsafe_segments(rel_path):
+            return self._send_json(400, {"ok": False, "error": "Invalid directory path"})
 
         path = self.translate_path(rel_path)
         if not self._check_path_safe(path):
@@ -605,6 +661,11 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         if stripped_path is None:
             return None
         return parsed._replace(path=stripped_path)
+
+    def _path_has_unsafe_segments(self, rel_path):
+        if "\\" in rel_path:
+            return True
+        return any(part in (".", "..") for part in rel_path.split("/") if part)
 
     def _send_json(self, code, data):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")

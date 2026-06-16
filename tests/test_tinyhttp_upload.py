@@ -128,6 +128,8 @@ def test_directory_listing_html_contains_modern_markup(server):
     # Modern listing template markers
     assert "Directory listing" in body
     assert 'id="drop"' in body
+    assert 'id="mkdir"' in body
+    assert "/_api/mkdir" in body
     assert "FormData" in body
     # No remnants of the old <ul> markup
     assert "<ul>" not in body
