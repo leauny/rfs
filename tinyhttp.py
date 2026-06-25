@@ -282,8 +282,9 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   }
 
   function add(files) {
+    var list = Array.prototype.slice.call(files);
+    if (!list.length) return;
     loadRemoteEntries(function (entries) {
-      var list = Array.prototype.slice.call(files);
       function next() {
         if (!list.length) { pump(); return; }
         resolveConflict(list.shift(), entries, function (item) {
