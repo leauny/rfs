@@ -140,6 +140,10 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
     var xhr = new XMLHttpRequest();
     xhr.open('POST', location.pathname + (item.overwrite ? '?overwrite=1' : ''), true);
 
+    var keepAliveTimer = setInterval(function () {
+      fetch(apiUrl('/_api/ping'), { method: 'GET', keepalive: true }).catch(function () {});
+    }, 30000);
+
     var t0 = Date.now(), lastT = t0, lastL = 0;
     bar.style.display = 'block';
     pb.style.width = '0';
@@ -159,6 +163,7 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
       }
     };
     xhr.onload = function () {
+      clearInterval(keepAliveTimer);
       busy = false;
       if (xhr.status >= 200 && xhr.status < 300) {
         var avg = file.size * 1000 / Math.max(1, Date.now() - t0);
@@ -173,6 +178,7 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
       }
     };
     xhr.onerror = function () {
+      clearInterval(keepAliveTimer);
       busy = false;
       meta.textContent = '网络错误：' + uploadName;
       pump();
@@ -343,6 +349,8 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         parsed = self._parse_prefixed_path()
         if parsed is None:
             return self.send_error(404, "File not found")
+        if parsed.path == "/_api/ping":
+            return self._send_json(200, {"ok": True})
         if parsed.path == "/_api/ls":
             return self._api_ls(parsed)
         if parsed.path == "/_api/trash":
@@ -356,6 +364,11 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             f.close()
 
     def do_HEAD(self):
+        parsed = self._parse_prefixed_path()
+        if parsed is None:
+            return self.send_error(404, "File not found")
+        if parsed.path == "/_api/ping":
+            return self._send_json(200, {"ok": True})
         f = self.send_head()
         if f:
             f.close()
