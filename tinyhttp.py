@@ -115,6 +115,20 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
     return n.toFixed(i ? 1 : 0) + ' ' + u[i];
   }
 
+  function fmtEta(s) {
+    s = Math.ceil(s);
+    if (s < 0) s = 0;
+    var d = Math.floor(s / 86400); s %= 86400;
+    var h = Math.floor(s / 3600);  s %= 3600;
+    var m = Math.floor(s / 60);   s %= 60;
+    var r = '';
+    if (d) r += d + 'd';
+    if (h || d) r += h + 'h';
+    if (m || h || d) r += m + 'm';
+    r += s + 's';
+    return r;
+  }
+
   function apiUrl(path) {
     var prefix = '$url_prefix';
     return (prefix || '') + path;
@@ -158,7 +172,7 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
         var spd = (e.loaded - lastL) * 1000 / (now - lastT);
         var eta = spd > 0 ? (e.total - e.loaded) / spd : 0;
         meta.textContent = uploadName + ' · ' + fmt(e.loaded) + ' / ' + fmt(e.total)
-          + ' · ' + fmt(spd) + '/s · 剩余 ' + Math.ceil(eta) + 's';
+          + ' · ' + fmt(spd) + '/s · 剩余 ' + fmtEta(eta);
         lastT = now; lastL = e.loaded;
       }
     };
