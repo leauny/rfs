@@ -42,14 +42,12 @@ class _CancelledError(Exception):
 
 def _fmt_size(n: int) -> str:
     """Format byte count to human-readable string."""
-    if n < 1024:
-        return f"{n} B"
-    elif n < 1024 * 1024:
-        return f"{n / 1024:.1f} KB"
-    elif n < 1024 * 1024 * 1024:
-        return f"{n / 1024 / 1024:.1f} MB"
-    else:
-        return f"{n / 1024 / 1024 / 1024:.2f} GB"
+    units = ("B", "KB", "MB", "GB", "TB")
+    i, size = 0, float(n)
+    while size >= 1024 and i < len(units) - 1:
+        size /= 1024
+        i += 1
+    return ("%.1f %s" if i else "%d %s") % (size, units[i])
 
 
 def _is_invalid_dir_name(name: str) -> bool:
@@ -59,12 +57,24 @@ def _is_invalid_dir_name(name: str) -> bool:
 
 def _fmt_speed(bps: float) -> str:
     """Format bytes/sec to human-readable speed."""
-    if bps < 1024:
-        return f"{bps:.0f} B/s"
-    elif bps < 1024 * 1024:
-        return f"{bps / 1024:.1f} KB/s"
-    else:
-        return f"{bps / 1024 / 1024:.1f} MB/s"
+    return _fmt_size(int(bps)) + "/s"
+
+
+def _fmt_eta(seconds: float) -> str:
+    """Format remaining seconds into d/h/m/s string."""
+    s = max(0, int(seconds + 0.5))
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    r = ""
+    if d:
+        r += f"{d}d"
+    if h or d:
+        r += f"{h}h"
+    if m or h or d:
+        r += f"{m}m"
+    r += f"{s}s"
+    return r
 
 
 class FileItem(ListItem):
@@ -676,32 +686,38 @@ class RfsApp(App):
 
         local_path = os.path.join(os.getcwd(), filename)
 
-        start_time = time.monotonic()
-        last_update_time = [start_time]
+        t0 = time.monotonic()
+        last_t = [t0]
+        last_n = [0]
 
         def on_progress(downloaded: int, total: int) -> None:
             if cancel_event.is_set():
                 raise _CancelledError()
 
             now = time.monotonic()
-            if now - last_update_time[0] < 0.1 and downloaded < total:
+            if now - last_t[0] < 0.1 and downloaded < total:
                 return
-            last_update_time[0] = now
 
-            elapsed = now - start_time
-            speed = downloaded / elapsed if elapsed > 0 else 0
-            speed_str = _fmt_speed(speed)
+            # Sliding-window speed: (current - last) / time_delta
+            dt = now - last_t[0]
+            spd = (downloaded - last_n[0]) / dt if dt > 0 else 0
+            last_t[0] = now
+            last_n[0] = downloaded
+
+            speed_str = _fmt_speed(spd)
             size_str = f"{_fmt_size(downloaded)}/{_fmt_size(total)}" if total > 0 else _fmt_size(downloaded)
+            eta = (total - downloaded) / spd if spd > 0 else 0
+            eta_str = f" {_fmt_eta(eta)}" if spd > 0 else ""
             percent = min(int(downloaded * 100 / total), 100) if total > 0 else 0
             self.call_from_thread(
-                self._update_task_progress, task_id, percent, speed_str, size_str, False
+                self._update_task_progress, task_id, percent, speed_str, f"{size_str}{eta_str}", False
             )
 
         try:
             _, local_md5, server_md5 = _download_with_progress(
                 self.server, self.proxies, remote_path, local_path, on_progress
             )
-            elapsed = time.monotonic() - start_time
+            elapsed = time.monotonic() - t0
             total_size = os.path.getsize(local_path) if os.path.exists(local_path) else 0
             avg_speed = total_size / elapsed if elapsed > 0 else 0
             final_size_str = _fmt_size(total_size)
@@ -745,25 +761,31 @@ class RfsApp(App):
         self.call_from_thread(self._add_task_widget, task_widget)
 
         remote_dir = self.current_path
-        start_time = time.monotonic()
-        last_update_time = [start_time]
+        t0 = time.monotonic()
+        last_t = [t0]
+        last_n = [0]
 
         def on_progress(uploaded: int, total: int) -> None:
             if cancel_event.is_set():
                 raise _CancelledError()
 
             now = time.monotonic()
-            if now - last_update_time[0] < 0.1 and uploaded < total:
+            if now - last_t[0] < 0.1 and uploaded < total:
                 return
-            last_update_time[0] = now
 
-            elapsed = now - start_time
-            speed = uploaded / elapsed if elapsed > 0 else 0
-            speed_str = _fmt_speed(speed)
+            # Sliding-window speed: (current - last) / time_delta
+            dt = now - last_t[0]
+            spd = (uploaded - last_n[0]) / dt if dt > 0 else 0
+            last_t[0] = now
+            last_n[0] = uploaded
+
+            speed_str = _fmt_speed(spd)
             size_str = f"{_fmt_size(uploaded)}/{_fmt_size(total)}" if total > 0 else _fmt_size(uploaded)
+            eta = (total - uploaded) / spd if spd > 0 else 0
+            eta_str = f" {_fmt_eta(eta)}" if spd > 0 else ""
             percent = min(int(uploaded * 100 / total), 100) if total > 0 else 0
             self.call_from_thread(
-                self._update_task_progress, task_id, percent, speed_str, size_str, False
+                self._update_task_progress, task_id, percent, speed_str, f"{size_str}{eta_str}", False
             )
 
         try:
@@ -771,7 +793,7 @@ class RfsApp(App):
                 self.server, self.proxies, local_file, remote_dir, on_progress,
                 remote_name=rename_to, overwrite=overwrite,
             )
-            elapsed = time.monotonic() - start_time
+            elapsed = time.monotonic() - t0
             total_size = os.path.getsize(local_file)
             avg_speed = total_size / elapsed if elapsed > 0 else 0
             final_size_str = _fmt_size(total_size)
