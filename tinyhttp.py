@@ -41,9 +41,14 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   .crumbs { color: #888; font-size: 13px; margin-bottom: 16px; }
   .crumbs a.parent { color: #06c; text-decoration: none; margin-left: 6px; }
   .crumbs a.parent:hover { text-decoration: underline; }
-  .toolbar { display: flex; justify-content: flex-end; margin-bottom: 12px; }
+  .toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .toolbar .spacer { flex: 1; }
   .toolbar button { border: 1px solid #ccd2d8; border-radius: 6px; background: #fff; padding: 6px 10px; cursor: pointer; }
   .toolbar button:hover { background: #f6f8fa; }
+  .toolbar input[type="search"] { border: 1px solid #ccd2d8; border-radius: 6px; padding: 6px 10px; outline: none; width: 180px; font-size: 13px; }
+  .toolbar input[type="search"]:focus { border-color: #2a7; box-shadow: 0 0 0 2px rgba(42,170,119,.15); }
+  .toolbar input[type="search"]::placeholder { color: #aaa; }
+  tr.hidden { display: none; }
   .drop { border: 2px dashed #cfd4d9; border-radius: 8px; padding: 24px; text-align: center; color: #666; transition: border-color .15s, background .15s; }
   .drop.hover { border-color: #2a7; background: #f3fbf6; color: #2a7; }
   .drop label { color: #06c; cursor: pointer; }
@@ -70,7 +75,7 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
 <body>
   <h2>$display_path</h2>
   <div class="crumbs">Directory listing $parent_link</div>
-  <div class="toolbar"><button id="mkdir" type="button">新建文件夹</button></div>
+  <div class="toolbar"><input id="search" type="search" placeholder="搜索文件…"><div class="spacer"></div><button id="refresh" type="button">刷新</button><button id="mkdir" type="button">新建文件夹</button></div>
 
   <div id="drop" class="drop">
     <span id="drop-idle">拖拽文件到此处，或 <label>点击选择<input id="file" type="file" multiple hidden></label></span>
@@ -340,6 +345,18 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   }
 
   mkdirBtn.addEventListener('click', createDirectory);
+  document.getElementById('refresh').addEventListener('click', function () { location.reload(); });
+  var searchInput = document.getElementById('search');
+  var tbody = document.querySelector('table tbody');
+  searchInput.addEventListener('input', function () {
+    var q = searchInput.value.trim().toLowerCase();
+    var rows = tbody.querySelectorAll('tr');
+    for (var i = 0; i < rows.length; i++) {
+      var link = rows[i].querySelector('td.name a');
+      if (!link) continue;
+      rows[i].classList.toggle('hidden', q && link.textContent.toLowerCase().indexOf(q) === -1);
+    }
+  });
   input.addEventListener('change', function () {
     add(input.files);
     input.value = '';
