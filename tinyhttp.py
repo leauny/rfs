@@ -47,6 +47,8 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   .drop { border: 2px dashed #cfd4d9; border-radius: 8px; padding: 24px; text-align: center; color: #666; transition: border-color .15s, background .15s; }
   .drop.hover { border-color: #2a7; background: #f3fbf6; color: #2a7; }
   .drop label { color: #06c; cursor: pointer; }
+  .drop.disabled { border-color: #e0e0e0; background: #f9f9f9; color: #aaa; pointer-events: none; }
+  .drop.disabled label { color: #aaa; cursor: default; }
   .bar { height: 6px; background: #eee; border-radius: 3px; overflow: hidden; margin: 12px auto 0; max-width: 480px; display: none; }
   .bar > div { height: 100%; width: 0; background: #2a7; transition: width .1s linear; }
   .meta { font-size: 12px; color: #666; margin-top: 6px; min-height: 16px; font-variant-numeric: tabular-nums; }
@@ -71,7 +73,8 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   <div class="toolbar"><button id="mkdir" type="button">新建文件夹</button></div>
 
   <div id="drop" class="drop">
-    拖拽文件到此处，或 <label>点击选择<input id="file" type="file" multiple hidden></label>
+    <span id="drop-idle">拖拽文件到此处，或 <label>点击选择<input id="file" type="file" multiple hidden></label></span>
+    <span id="drop-busy" style="display:none">上传中，请等待…</span>
     <div class="bar"><div id="pb"></div></div>
     <div id="meta" class="meta"></div>
   </div>
@@ -107,7 +110,23 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   var overwriteBtn = document.getElementById('overwrite');
   var renameBtn = document.getElementById('rename-btn');
   var cancelBtn = document.getElementById('cancel');
+  var dropIdle = document.getElementById('drop-idle');
+  var dropBusy = document.getElementById('drop-busy');
   var queue = [], busy = false, remoteEntries = null;
+
+  function setDropState(uploading) {
+    if (uploading) {
+      drop.classList.add('disabled');
+      dropIdle.style.display = 'none';
+      dropBusy.style.display = '';
+      input.disabled = true;
+    } else {
+      drop.classList.remove('disabled');
+      dropIdle.style.display = '';
+      dropBusy.style.display = 'none';
+      input.disabled = false;
+    }
+  }
 
   function fmt(n) {
     var u = ['B', 'KB', 'MB', 'GB', 'TB'], i = 0;
@@ -145,6 +164,7 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   function pump() {
     if (busy || !queue.length) return;
     busy = true;
+    setDropState(true);
     var item = queue.shift();
     var file = item.file;
     var uploadName = item.name || file.name;
@@ -185,17 +205,17 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
         pb.style.width = '100%';
         meta.textContent = uploadName + ' · 完成 · 平均 ' + fmt(avg) + '/s' + (md5 ? ' · MD5 ' + md5 : '');
         if (queue.length) pump();
-        else setTimeout(function () { location.reload(); }, 500);
+        else { setDropState(false); setTimeout(function () { location.reload(); }, 500); }
       } else {
         meta.textContent = '上传失败 (' + xhr.status + '): ' + uploadName;
-        pump();
+        if (queue.length) pump(); else setDropState(false);
       }
     };
     xhr.onerror = function () {
       clearInterval(keepAliveTimer);
       busy = false;
       meta.textContent = '网络错误：' + uploadName;
-      pump();
+      if (queue.length) pump(); else setDropState(false);
     };
     xhr.send(fd);
   }
