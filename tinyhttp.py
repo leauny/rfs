@@ -91,6 +91,8 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   .toolbar .spacer { flex: 1; }
   .toolbar button { border: 1px solid #ccd2d8; border-radius: 6px; background: #fff; padding: 6px 10px; cursor: pointer; }
   .toolbar button:hover { background: #f6f8fa; }
+  .toolbar .toggle { display: inline-flex; align-items: center; gap: 5px; color: #666; font-size: 13px; white-space: nowrap; }
+  .toolbar .toggle input { margin: 0; }
   .toolbar input[type="search"] { border: 1px solid #ccd2d8; border-radius: 6px; padding: 6px 10px; outline: none; width: 180px; font-size: 13px; }
   .toolbar input[type="search"]:focus { border-color: #2a7; box-shadow: 0 0 0 2px rgba(42,170,119,.15); }
   .toolbar input[type="search"]::placeholder { color: #aaa; }
@@ -111,6 +113,9 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   table { width: 100%; border-collapse: collapse; margin-top: 20px; }
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #eee; }
   th { font-weight: 500; color: #888; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  th .sort { display: inline-flex; align-items: center; gap: 4px; border: 0; background: transparent; color: inherit; cursor: pointer; font: inherit; letter-spacing: inherit; padding: 0; text-transform: inherit; }
+  th .sort:hover { color: #222; }
+  th .sort-icon { display: inline-block; min-width: 1em; color: #aaa; }
   td.name a { color: #06c; text-decoration: none; }
   td.name a:hover { text-decoration: underline; }
   td.size, td.mtime { color: #888; font-variant-numeric: tabular-nums; white-space: nowrap; width: 1%; }
@@ -122,7 +127,7 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   <h2>$display_path</h2>
   <div class="crumbs">Directory listing $parent_link</div>
   <div id="task-indicator" class="indicator unknown"><div id="task-label">检查任务状态…</div><button id="task-refresh" type="button" class="task-refresh" title="立即刷新">↻</button></div>
-  <div class="toolbar"><input id="search" type="search" placeholder="搜索文件…"><div class="spacer"></div><button id="refresh" type="button">刷新</button><button id="mkdir" type="button">新建文件夹</button></div>
+  <div class="toolbar"><input id="search" type="search" placeholder="搜索文件…"><label class="toggle"><input id="show-hidden" type="checkbox">显示隐藏</label><div class="spacer"></div><button id="refresh" type="button">刷新</button><button id="mkdir" type="button">新建文件夹</button></div>
   <div id="toast" class="toast" role="alert" aria-live="polite"></div>
 
   <div id="drop" class="drop">
@@ -143,7 +148,7 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   </dialog>
 
   <table>
-    <thead><tr><th>名称</th><th class="size">大小</th><th class="mtime">修改时间</th></tr></thead>
+    <thead><tr><th aria-sort="ascending"><button class="sort" type="button" data-sort="name">名称 <span class="sort-icon">↑</span></button></th><th class="size" aria-sort="none"><button class="sort" type="button" data-sort="size">大小 <span class="sort-icon">↕</span></button></th><th class="mtime" aria-sort="none"><button class="sort" type="button" data-sort="mtime">修改时间 <span class="sort-icon">↕</span></button></th></tr></thead>
     <tbody>
       $rows
     </tbody>
@@ -166,8 +171,10 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   var dropIdle = document.getElementById('drop-idle');
   var dropBusy = document.getElementById('drop-busy');
   var toast = document.getElementById('toast');
+  var showHiddenInput = document.getElementById('show-hidden');
   var toastTimer = null;
-  var queue = [], busy = false, remoteEntries = null;
+  var queue = [], busy = false, remoteEntries = null, currentEntries = null;
+  var currentSort = { field: 'name', dir: 'asc' };
 
   function setDropState(uploading) {
     if (uploading) {
@@ -293,13 +300,16 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
 
   function fetchRemoteEntries(cb) {
     var xhr = new XMLHttpRequest();
-    xhr.open('GET', apiUrl('/_api/ls') + '?path=' + encodeURIComponent(remotePath()), true);
+    var url = apiUrl('/_api/ls') + '?path=' + encodeURIComponent(remotePath());
+    if (showHiddenInput.checked) url += '&show_hidden=1';
+    xhr.open('GET', url, true);
     xhr.onload = function () {
       if (xhr.status >= 200 && xhr.status < 300) {
         try {
           var data = JSON.parse(xhr.responseText);
           if (data.ok) {
             remoteEntries = entryMapFromList(data.entries);
+            currentEntries = data.entries.slice();
             cb(data.entries);
             return;
           }
@@ -317,6 +327,48 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
     fetchRemoteEntries(function () { cb(remoteEntries || {}); });
   }
 
+  function compareValues(a, b) {
+    if (typeof a === 'string' || typeof b === 'string') {
+      return String(a || '').localeCompare(String(b || ''), undefined, { numeric: true, sensitivity: 'base' });
+    }
+    a = Number(a) || 0;
+    b = Number(b) || 0;
+    return a === b ? 0 : (a < b ? -1 : 1);
+  }
+
+  function sortValue(entry, field) {
+    if (field === 'size') return entry.type === 'dir' ? null : (entry.size || 0);
+    if (field === 'mtime') return entry.type === 'dir' ? null : (entry.mtime || 0);
+    return entry.name || '';
+  }
+
+  function sortEntries(entries) {
+    var field = currentSort.field;
+    var dir = currentSort.dir === 'desc' ? -1 : 1;
+    return entries.slice().sort(function (a, b) {
+      var av = sortValue(a, field);
+      var bv = sortValue(b, field);
+      if (av === null && bv !== null) return 1;
+      if (av !== null && bv === null) return -1;
+      var cmp = compareValues(av, bv);
+      if (!cmp && field !== 'name') cmp = compareValues(a.name, b.name);
+      return cmp * dir;
+    });
+  }
+
+  function updateSortIndicators() {
+    var buttons = document.querySelectorAll('button[data-sort]');
+    for (var i = 0; i < buttons.length; i++) {
+      var btn = buttons[i];
+      var field = btn.getAttribute('data-sort');
+      var active = field === currentSort.field;
+      var th = btn.parentNode;
+      var icon = btn.querySelector('.sort-icon');
+      if (th) th.setAttribute('aria-sort', active ? (currentSort.dir === 'asc' ? 'ascending' : 'descending') : 'none');
+      if (icon) icon.textContent = active ? (currentSort.dir === 'asc' ? '↑' : '↓') : '↕';
+    }
+  }
+
   function renderListing(entries) {
     clearNode(tbody);
     if (!entries || !entries.length) {
@@ -329,7 +381,7 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
       tbody.appendChild(emptyRow);
       return;
     }
-    entries.forEach(function (entry) {
+    sortEntries(entries).forEach(function (entry) {
       var row = document.createElement('tr');
       var nameCell = document.createElement('td');
       var sizeCell = document.createElement('td');
@@ -362,6 +414,22 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
       renderListing(entries);
       searchInput.dispatchEvent(new Event('input'));
     });
+  }
+
+  function applySort(field) {
+    if (currentSort.field === field) {
+      currentSort.dir = currentSort.dir === 'asc' ? 'desc' : 'asc';
+    } else {
+      currentSort.field = field;
+      currentSort.dir = 'asc';
+    }
+    updateSortIndicators();
+    if (currentEntries) {
+      renderListing(currentEntries);
+      searchInput.dispatchEvent(new Event('input'));
+      return;
+    }
+    refreshListing();
   }
 
   function joinRemotePath(name) {
@@ -466,8 +534,16 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
 
   mkdirBtn.addEventListener('click', createDirectory);
   document.getElementById('refresh').addEventListener('click', refreshListing);
+  showHiddenInput.addEventListener('change', refreshListing);
   var searchInput = document.getElementById('search');
   var tbody = document.querySelector('table tbody');
+  var sortButtons = document.querySelectorAll('button[data-sort]');
+  for (var s = 0; s < sortButtons.length; s++) {
+    sortButtons[s].addEventListener('click', function () {
+      applySort(this.getAttribute('data-sort'));
+    });
+  }
+  updateSortIndicators();
   searchInput.addEventListener('input', function () {
     var q = searchInput.value.trim().toLowerCase();
     var rows = tbody.querySelectorAll('tr');
@@ -1186,6 +1262,8 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
         rows = []
         for name in names:
             if name == ".Trash":
+                continue
+            if name.startswith("."):
                 continue
             fullname = os.path.join(path, name)
             is_dir = os.path.isdir(fullname)

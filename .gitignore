@@ -12,3 +12,7 @@ wheels/
 # OS generated files
 .DS_Store
 .ace-tool/
+
+# Dev
+.vscode/
+.playwright-mcp/

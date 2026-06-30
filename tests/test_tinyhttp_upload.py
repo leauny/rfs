@@ -129,8 +129,14 @@ def test_directory_listing_html_contains_modern_markup(server):
     assert "Directory listing" in body
     assert 'id="drop"' in body
     assert 'id="mkdir"' in body
+    assert 'id="show-hidden"' in body
     assert "/_api/mkdir" in body
     assert "FormData" in body
+    assert 'data-sort="name"' in body
+    assert 'data-sort="size"' in body
+    assert 'data-sort="mtime"' in body
+    assert "function sortEntries(entries)" in body
+    assert "applySort(this.getAttribute('data-sort'))" in body
     assert "taskLabel.innerHTML" not in body
     assert "document.createElement('li')" in body
     assert "addEventListener('click', refreshListing)" in body
@@ -140,6 +146,15 @@ def test_directory_listing_html_contains_modern_markup(server):
     assert "列表已刷新" not in body
     # No remnants of the old <ul> markup
     assert "<ul>" not in body
+
+
+def test_directory_listing_hides_dotfiles_by_default(server):
+    server.server_path(".hidden").write_bytes(b"x")
+    server.server_path("visible.txt").write_bytes(b"y")
+    resp = requests.get(server.url + "/", timeout=5)
+    assert resp.status_code == 200
+    assert "visible.txt" in resp.text
+    assert 'href=".hidden"' not in resp.text
 
 
 def test_parent_link_on_subdir(server):
