@@ -148,6 +148,12 @@ def test_directory_listing_html_contains_modern_markup(server):
     assert "data-task-status" in body
     assert "draggable = true" in body
     assert "服务端可能已写入部分文件" in body
+    assert "function loadFreshConflictEntries(cb)" in body
+    assert "{ includeHidden: true, skipListing: true }" in body
+    assert "远端已存在同名文件或目录" in body
+    assert "showToast('上传失败：远端已存在同名文件或目录')" in body
+    assert "function cancelConflict()" in body
+    assert "setTimeout(refreshListing, 0)" in body
     assert "taskLabel.innerHTML" not in body
     assert "document.createElement('li')" in body
     assert "addEventListener('click', refreshListing)" in body

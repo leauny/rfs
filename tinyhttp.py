@@ -315,6 +315,13 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
     return fmtEta(ms / 1000);
   }
 
+  function uploadFailureMessage(task, xhr) {
+    if (xhr.status === 409) {
+      return '远端已存在同名文件或目录，请重新选择覆盖或重命名：' + task.name;
+    }
+    return '上传失败 (HTTP ' + xhr.status + '): ' + task.name;
+  }
+
   function taskDetail(task) {
     if (task.status === 'pending') return fmt(task.size) + ' · 目标 ' + task.path;
     if (task.status === 'running') {
@@ -480,8 +487,12 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
         setTimeout(refreshListing, 500);
       } else {
         task.status = 'failed';
-        task.error = 'HTTP ' + xhr.status;
-        meta.textContent = '上传失败 (' + xhr.status + '): ' + task.name;
+        task.error = uploadFailureMessage(task, xhr);
+        meta.textContent = task.error;
+        if (xhr.status === 409) {
+          showToast('上传失败：远端已存在同名文件或目录');
+          setTimeout(refreshListing, 300);
+        }
       }
       finishRunningTask(task);
     };
@@ -508,10 +519,14 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
     return entries;
   }
 
-  function fetchRemoteEntries(cb) {
+  function fetchRemoteEntries(cb, options) {
+    options = options || {};
     var xhr = new XMLHttpRequest();
     var url = apiUrl('/_api/ls') + '?path=' + encodeURIComponent(remotePath());
-    if (showHiddenInput.checked) url += '&show_hidden=1';
+    var includeHidden = Object.prototype.hasOwnProperty.call(options, 'includeHidden')
+      ? options.includeHidden
+      : showHiddenInput.checked;
+    if (includeHidden) url += '&show_hidden=1';
     xhr.open('GET', url, true);
     xhr.onload = function () {
       if (xhr.status >= 200 && xhr.status < 300) {
@@ -519,7 +534,7 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
           var data = JSON.parse(xhr.responseText);
           if (data.ok) {
             remoteEntries = entryMapFromList(data.entries);
-            currentEntries = data.entries.slice();
+            if (!options.skipListing) currentEntries = data.entries.slice();
             cb(data.entries);
             return;
           }
@@ -535,6 +550,12 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   function loadRemoteEntries(cb) {
     if (remoteEntries) { cb(remoteEntries); return; }
     fetchRemoteEntries(function () { cb(remoteEntries || {}); });
+  }
+
+  function loadFreshConflictEntries(cb) {
+    fetchRemoteEntries(function (entries) {
+      cb(entries ? entryMapFromList(entries) : (remoteEntries || {}));
+    }, { includeHidden: true, skipListing: true });
   }
 
   function compareValues(a, b) {
@@ -706,6 +727,10 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
       dialog.close();
       cb(result);
     }
+    function cancelConflict() {
+      done(null);
+      setTimeout(refreshListing, 0);
+    }
     overwriteBtn.onclick = function () { done({ file: file, name: file.name, overwrite: true }); };
     renameBtn.onclick = function () {
       var name = renameInput.value.trim();
@@ -719,8 +744,8 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
       }
       done({ file: file, name: name, overwrite: false });
     };
-    cancelBtn.onclick = function () { done(null); };
-    dialog.oncancel = function (e) { e.preventDefault(); done(null); };
+    cancelBtn.onclick = cancelConflict;
+    dialog.oncancel = function (e) { e.preventDefault(); cancelConflict(); };
     dialog.showModal();
   }
 
@@ -738,7 +763,7 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   function add(files) {
     var list = Array.prototype.slice.call(files);
     if (!list.length) return;
-    loadRemoteEntries(function (baseEntries) {
+    loadFreshConflictEntries(function (baseEntries) {
       var entries = entriesWithQueuedNames(baseEntries);
       function next() {
         if (!list.length) {
