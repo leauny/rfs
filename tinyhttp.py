@@ -102,9 +102,35 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   .drop label { color: #06c; cursor: pointer; }
   .drop.disabled { border-color: #e0e0e0; background: #f9f9f9; color: #aaa; pointer-events: none; }
   .drop.disabled label { color: #aaa; cursor: default; }
+  .drop.active { border-color: #f3d7b3; background: #fffaf3; }
   .bar { height: 6px; background: #eee; border-radius: 3px; overflow: hidden; margin: 12px auto 0; max-width: 480px; display: none; }
   .bar > div { height: 100%; width: 0; background: #2a7; transition: width .1s linear; }
   .meta { font-size: 12px; color: #666; margin-top: 6px; min-height: 16px; font-variant-numeric: tabular-nums; }
+  .queue-panel { margin: 14px 0 18px; border: 1px solid #e1e4e8; border-radius: 8px; overflow: hidden; background: #fff; }
+  .queue-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #eee; background: #fafafa; }
+  .queue-head h3 { margin: 0; font-size: 14px; font-weight: 600; }
+  .queue-summary { color: #888; font-size: 12px; }
+  .task-list { min-height: 42px; }
+  .task-empty { color: #aaa; font-size: 13px; padding: 16px 12px; text-align: center; }
+  .task-row { display: grid; grid-template-columns: 28px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 10px 12px; border-top: 1px solid #f0f0f0; }
+  .task-row:first-child { border-top: 0; }
+  .task-row.dragging { opacity: .45; }
+  .task-handle { color: #aaa; cursor: grab; user-select: none; text-align: center; }
+  .task-handle.disabled { cursor: default; opacity: .35; }
+  .task-main { min-width: 0; }
+  .task-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .task-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+  .task-badge { flex: 0 0 auto; border-radius: 999px; padding: 1px 7px; font-size: 12px; background: #f1f5f9; color: #64748b; }
+  .task-badge.pending { background: #f6f8fa; color: #667085; }
+  .task-badge.running { background: #fff7ed; color: #b3591a; }
+  .task-badge.done { background: #f3fbf6; color: #2a7; }
+  .task-badge.failed { background: #fff1f2; color: #b42318; }
+  .task-badge.canceled { background: #f4f4f5; color: #71717a; }
+  .task-detail { color: #777; font-size: 12px; margin-top: 3px; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .task-progress { height: 4px; margin-top: 7px; background: #eee; border-radius: 2px; overflow: hidden; }
+  .task-progress > div { height: 100%; width: 0; background: #2a7; transition: width .1s linear; }
+  .task-actions button { border: 1px solid #ccd2d8; border-radius: 6px; background: #fff; padding: 4px 8px; cursor: pointer; font-size: 12px; }
+  .task-actions button:hover { background: #f6f8fa; }
   dialog { border: 1px solid #ccd2d8; border-radius: 8px; padding: 18px; box-shadow: 0 8px 30px rgba(0,0,0,.18); min-width: 320px; }
   dialog::backdrop { background: rgba(0,0,0,.25); }
   dialog p { margin: 0 0 12px; }
@@ -132,10 +158,15 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
 
   <div id="drop" class="drop">
     <span id="drop-idle">拖拽文件到此处，或 <label>点击选择<input id="file" type="file" multiple hidden></label></span>
-    <span id="drop-busy" style="display:none">上传中，请等待…</span>
+    <span id="drop-busy" style="display:none">上传中，可继续添加文件…</span>
     <div class="bar"><div id="pb"></div></div>
     <div id="meta" class="meta"></div>
   </div>
+
+  <section id="upload-queue" class="queue-panel" aria-label="上传任务队列">
+    <div class="queue-head"><h3>上传任务</h3><span id="queue-summary" class="queue-summary">暂无任务</span></div>
+    <div id="upload-task-list" class="task-list" data-task-list></div>
+  </section>
 
   <dialog id="conflict">
     <p id="conflict-msg"></p>
@@ -172,18 +203,21 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   var dropBusy = document.getElementById('drop-busy');
   var toast = document.getElementById('toast');
   var showHiddenInput = document.getElementById('show-hidden');
+  var taskList = document.getElementById('upload-task-list');
+  var queueSummary = document.getElementById('queue-summary');
   var toastTimer = null;
-  var queue = [], busy = false, remoteEntries = null, currentEntries = null;
+  var uploadTasks = [], activeTask = null, remoteEntries = null, currentEntries = null;
+  var taskSeq = 0, draggedTaskId = null, draggingTasks = false;
   var currentSort = { field: 'name', dir: 'asc' };
 
   function setDropState(uploading) {
     if (uploading) {
-      drop.classList.add('disabled');
-      dropIdle.style.display = 'none';
+      drop.classList.add('active');
+      dropIdle.style.display = '';
       dropBusy.style.display = '';
-      input.disabled = true;
+      input.disabled = false;
     } else {
-      drop.classList.remove('disabled');
+      drop.classList.remove('active');
       dropIdle.style.display = '';
       dropBusy.style.display = 'none';
       input.disabled = false;
@@ -233,61 +267,237 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
     return path;
   }
 
-  function pump() {
-    if (busy || !queue.length) return;
-    busy = true;
-    setDropState(true);
-    var item = queue.shift();
+  function createUploadTask(item) {
     var file = item.file;
-    var uploadName = item.name || file.name;
+    var name = item.name || file.name;
+    return {
+      id: 'u' + (++taskSeq),
+      file: file,
+      name: name,
+      overwrite: !!item.overwrite,
+      status: 'pending',
+      size: file.size,
+      path: joinRemotePath(name),
+      loaded: 0,
+      progress: 0,
+      speed: 0,
+      eta: 0,
+      startedAt: null,
+      finishedAt: null,
+      avgSpeed: 0,
+      md5: '',
+      error: '',
+      xhr: null,
+      keepAliveTimer: null,
+      cancelRequested: false,
+      lastT: 0,
+      lastLoaded: 0
+    };
+  }
+
+  function taskStatusLabel(status) {
+    return {
+      pending: '等待中',
+      running: '进行中',
+      done: '已完成',
+      failed: '失败',
+      canceled: '已取消'
+    }[status] || status;
+  }
+
+  function fmtClock(ms) {
+    if (!ms) return '—';
+    return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
+
+  function fmtDuration(ms) {
+    if (!ms || ms < 0) return '0s';
+    return fmtEta(ms / 1000);
+  }
+
+  function taskDetail(task) {
+    if (task.status === 'pending') return fmt(task.size) + ' · 目标 ' + task.path;
+    if (task.status === 'running') {
+      return fmt(task.loaded) + ' / ' + fmt(task.size) + ' · ' + fmt(task.speed) + '/s · 剩余 ' + fmtEta(task.eta);
+    }
+    if (task.status === 'done') {
+      return '完成 ' + fmtClock(task.finishedAt) + ' · 耗时 ' + fmtDuration(task.finishedAt - task.startedAt)
+        + ' · 平均 ' + fmt(task.avgSpeed) + '/s' + (task.md5 ? ' · MD5 ' + task.md5 : '');
+    }
+    if (task.status === 'failed') return '失败 ' + fmtClock(task.finishedAt) + ' · ' + (task.error || '上传失败');
+    if (task.status === 'canceled') return '已取消 ' + fmtClock(task.finishedAt) + ' · 服务端可能已写入部分文件';
+    return '';
+  }
+
+  function summarizeTasks() {
+    var counts = { pending: 0, running: 0, done: 0, failed: 0, canceled: 0 };
+    uploadTasks.forEach(function (task) { counts[task.status] = (counts[task.status] || 0) + 1; });
+    if (!uploadTasks.length) return '暂无任务';
+    return '等待 ' + counts.pending + ' · 进行中 ' + counts.running + ' · 完成 ' + counts.done
+      + ' · 失败 ' + counts.failed + ' · 取消 ' + counts.canceled;
+  }
+
+  function renderQueue() {
+    clearNode(taskList);
+    queueSummary.textContent = summarizeTasks();
+    if (!uploadTasks.length) {
+      var empty = document.createElement('div');
+      empty.className = 'task-empty';
+      empty.textContent = '暂无上传任务';
+      taskList.appendChild(empty);
+      return;
+    }
+    uploadTasks.forEach(function (task) {
+      var row = document.createElement('div');
+      row.className = 'task-row' + (task.id === draggedTaskId ? ' dragging' : '');
+      row.setAttribute('data-task-id', task.id);
+      row.setAttribute('data-task-status', task.status);
+      if (task.status === 'pending') row.draggable = true;
+
+      var handle = document.createElement('div');
+      handle.className = 'task-handle' + (task.status === 'pending' ? '' : ' disabled');
+      handle.textContent = task.status === 'pending' ? '☰' : '•';
+      handle.title = task.status === 'pending' ? '拖动调整上传顺序' : '任务已开始，不能调整顺序';
+
+      var main = document.createElement('div');
+      main.className = 'task-main';
+      var title = document.createElement('div');
+      title.className = 'task-title';
+      var badge = document.createElement('span');
+      badge.className = 'task-badge ' + task.status;
+      badge.textContent = taskStatusLabel(task.status);
+      var name = document.createElement('span');
+      name.className = 'task-name';
+      name.textContent = task.name;
+      title.appendChild(badge);
+      title.appendChild(name);
+      var detail = document.createElement('div');
+      detail.className = 'task-detail';
+      detail.textContent = taskDetail(task);
+      var taskBar = document.createElement('div');
+      taskBar.className = 'task-progress';
+      var taskFill = document.createElement('div');
+      taskFill.style.width = Math.max(0, Math.min(100, task.progress || 0)).toFixed(1) + '%';
+      taskBar.appendChild(taskFill);
+      main.appendChild(title);
+      main.appendChild(detail);
+      main.appendChild(taskBar);
+
+      var actions = document.createElement('div');
+      actions.className = 'task-actions';
+      var del = document.createElement('button');
+      del.type = 'button';
+      del.setAttribute('data-task-action', 'delete');
+      del.setAttribute('data-task-id', task.id);
+      del.textContent = task.status === 'running' ? '取消' : '删除';
+      actions.appendChild(del);
+
+      row.appendChild(handle);
+      row.appendChild(main);
+      row.appendChild(actions);
+      taskList.appendChild(row);
+    });
+  }
+
+  function pendingTasks() {
+    return uploadTasks.filter(function (task) { return task.status === 'pending'; });
+  }
+
+  function finishRunningTask(task) {
+    if (task.keepAliveTimer) clearInterval(task.keepAliveTimer);
+    task.keepAliveTimer = null;
+    task.xhr = null;
+    activeTask = null;
+    setDropState(!!pendingTasks().length);
+    renderQueue();
+    setTimeout(scheduleUploads, 0);
+  }
+
+  function scheduleUploads() {
+    if (activeTask || draggingTasks) return;
+    var next = pendingTasks()[0];
+    if (!next) {
+      setDropState(false);
+      return;
+    }
+    startUploadTask(next);
+  }
+
+  function startUploadTask(task) {
+    if (!task || task.status !== 'pending' || activeTask) return;
+    activeTask = task;
+    task.status = 'running';
+    task.startedAt = Date.now();
+    task.lastT = task.startedAt;
+    task.lastLoaded = 0;
+    task.loaded = 0;
+    task.progress = 0;
+    task.speed = 0;
+    task.eta = 0;
+    task.error = '';
+    setDropState(true);
+
     var fd = new FormData();
-    fd.append('file', file, uploadName);
-
+    fd.append('file', task.file, task.name);
     var xhr = new XMLHttpRequest();
-    xhr.open('POST', location.pathname + (item.overwrite ? '?overwrite=1' : ''), true);
-
-    var keepAliveTimer = setInterval(function () {
+    task.xhr = xhr;
+    xhr.open('POST', location.pathname + (task.overwrite ? '?overwrite=1' : ''), true);
+    task.keepAliveTimer = setInterval(function () {
       fetch(apiUrl('/_api/ping'), { method: 'GET', keepalive: true }).catch(function () {});
     }, 30000);
 
-    var t0 = Date.now(), lastT = t0, lastL = 0;
     bar.style.display = 'block';
     pb.style.width = '0';
-    meta.textContent = uploadName + ' · 0 / ' + fmt(file.size);
+    meta.textContent = task.name + ' · 0 / ' + fmt(task.size);
+    renderQueue();
 
     xhr.upload.onprogress = function (e) {
       if (!e.lengthComputable) return;
-      var pct = e.loaded * 100 / e.total;
-      pb.style.width = pct.toFixed(1) + '%';
       var now = Date.now();
-      if (now - lastT > 200) {
-        var spd = (e.loaded - lastL) * 1000 / (now - lastT);
-        var eta = spd > 0 ? (e.total - e.loaded) / spd : 0;
-        meta.textContent = uploadName + ' · ' + fmt(e.loaded) + ' / ' + fmt(e.total)
-          + ' · ' + fmt(spd) + '/s · 剩余 ' + fmtEta(eta);
-        lastT = now; lastL = e.loaded;
+      task.loaded = e.loaded;
+      task.progress = e.total ? e.loaded * 100 / e.total : 0;
+      pb.style.width = task.progress.toFixed(1) + '%';
+      if (now - task.lastT > 200) {
+        task.speed = (e.loaded - task.lastLoaded) * 1000 / (now - task.lastT);
+        task.eta = task.speed > 0 ? (e.total - e.loaded) / task.speed : 0;
+        meta.textContent = task.name + ' · ' + fmt(e.loaded) + ' / ' + fmt(e.total)
+          + ' · ' + fmt(task.speed) + '/s · 剩余 ' + fmtEta(task.eta);
+        task.lastT = now;
+        task.lastLoaded = e.loaded;
+        renderQueue();
       }
     };
     xhr.onload = function () {
-      clearInterval(keepAliveTimer);
-      busy = false;
+      task.finishedAt = Date.now();
       if (xhr.status >= 200 && xhr.status < 300) {
-        var avg = file.size * 1000 / Math.max(1, Date.now() - t0);
-        var md5 = xhr.getResponseHeader('X-Content-MD5');
+        task.status = 'done';
+        task.loaded = task.size;
+        task.progress = 100;
+        task.md5 = xhr.getResponseHeader('X-Content-MD5') || '';
+        task.avgSpeed = task.size * 1000 / Math.max(1, task.finishedAt - task.startedAt);
         pb.style.width = '100%';
-        meta.textContent = uploadName + ' · 完成 · 平均 ' + fmt(avg) + '/s' + (md5 ? ' · MD5 ' + md5 : '');
-        if (queue.length) pump();
-        else { setDropState(false); setTimeout(refreshListing, 500); }
+        meta.textContent = task.name + ' · 完成 · 平均 ' + fmt(task.avgSpeed) + '/s' + (task.md5 ? ' · MD5 ' + task.md5 : '');
+        setTimeout(refreshListing, 500);
       } else {
-        meta.textContent = '上传失败 (' + xhr.status + '): ' + uploadName;
-        if (queue.length) pump(); else setDropState(false);
+        task.status = 'failed';
+        task.error = 'HTTP ' + xhr.status;
+        meta.textContent = '上传失败 (' + xhr.status + '): ' + task.name;
       }
+      finishRunningTask(task);
     };
     xhr.onerror = function () {
-      clearInterval(keepAliveTimer);
-      busy = false;
-      meta.textContent = '网络错误：' + uploadName;
-      if (queue.length) pump(); else setDropState(false);
+      task.finishedAt = Date.now();
+      task.status = task.cancelRequested ? 'canceled' : 'failed';
+      task.error = task.cancelRequested ? '用户取消' : '网络错误';
+      meta.textContent = (task.cancelRequested ? '已取消：' : '网络错误：') + task.name;
+      finishRunningTask(task);
+    };
+    xhr.onabort = function () {
+      task.finishedAt = Date.now();
+      task.status = 'canceled';
+      task.error = '用户取消';
+      meta.textContent = '已取消：' + task.name;
+      finishRunningTask(task);
     };
     xhr.send(fd);
   }
@@ -514,16 +724,33 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
     dialog.showModal();
   }
 
+  function entriesWithQueuedNames(baseEntries) {
+    var entries = {};
+    Object.keys(baseEntries || {}).forEach(function (name) { entries[name] = baseEntries[name]; });
+    uploadTasks.forEach(function (task) {
+      if (task.status === 'pending' || task.status === 'running' || task.status === 'done') {
+        entries[task.name] = false;
+      }
+    });
+    return entries;
+  }
+
   function add(files) {
     var list = Array.prototype.slice.call(files);
     if (!list.length) return;
-    loadRemoteEntries(function (entries) {
+    loadRemoteEntries(function (baseEntries) {
+      var entries = entriesWithQueuedNames(baseEntries);
       function next() {
-        if (!list.length) { pump(); return; }
+        if (!list.length) {
+          renderQueue();
+          scheduleUploads();
+          return;
+        }
         resolveConflict(list.shift(), entries, function (item) {
           if (item) {
-            queue.push(item);
+            uploadTasks.push(createUploadTask(item));
             entries[item.name] = false;
+            renderQueue();
           }
           next();
         });
@@ -568,6 +795,69 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
       add(e.dataTransfer.files);
     }
   });
+  taskList.addEventListener('click', function (e) {
+    var btn = e.target.closest('button[data-task-action="delete"]');
+    if (!btn) return;
+    var id = btn.getAttribute('data-task-id');
+    var task = uploadTasks.find(function (t) { return t.id === id; });
+    if (!task) return;
+    if (task.status === 'running') {
+      var ok = confirm('取消正在上传的任务只会中断浏览器请求，服务端可能已写入部分文件，需要你自行检查。确定取消吗？');
+      if (!ok) return;
+      task.cancelRequested = true;
+      if (task.xhr) task.xhr.abort();
+      return;
+    }
+    uploadTasks = uploadTasks.filter(function (t) { return t.id !== id; });
+    renderQueue();
+    scheduleUploads();
+  });
+  taskList.addEventListener('dragstart', function (e) {
+    var row = e.target.closest('.task-row[data-task-status="pending"]');
+    if (!row) {
+      e.preventDefault();
+      return;
+    }
+    draggedTaskId = row.getAttribute('data-task-id');
+    draggingTasks = true;
+    if (e.dataTransfer) {
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', draggedTaskId);
+    }
+    row.classList.add('dragging');
+  });
+  taskList.addEventListener('dragover', function (e) {
+    var row = e.target.closest('.task-row[data-task-status="pending"]');
+    if (!draggedTaskId || !row || row.getAttribute('data-task-id') === draggedTaskId) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+  });
+  taskList.addEventListener('drop', function (e) {
+    var row = e.target.closest('.task-row[data-task-status="pending"]');
+    if (!draggedTaskId || !row) return;
+    e.preventDefault();
+    var targetId = row.getAttribute('data-task-id');
+    if (targetId && targetId !== draggedTaskId) {
+      var from = uploadTasks.findIndex(function (task) { return task.id === draggedTaskId; });
+      var to = uploadTasks.findIndex(function (task) { return task.id === targetId; });
+      if (from !== -1 && to !== -1 && uploadTasks[from].status === 'pending' && uploadTasks[to].status === 'pending') {
+        var moved = uploadTasks.splice(from, 1)[0];
+        if (from < to) to -= 1;
+        uploadTasks.splice(to, 0, moved);
+      }
+    }
+    draggedTaskId = null;
+    draggingTasks = false;
+    renderQueue();
+    scheduleUploads();
+  });
+  taskList.addEventListener('dragend', function () {
+    draggedTaskId = null;
+    draggingTasks = false;
+    renderQueue();
+    scheduleUploads();
+  });
+  renderQueue();
 
   // ── Running-task indicator (polls /_api/tasks every 5s) ──
   var indicator = document.getElementById('task-indicator');

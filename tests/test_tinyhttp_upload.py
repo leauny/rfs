@@ -128,6 +128,9 @@ def test_directory_listing_html_contains_modern_markup(server):
     # Modern listing template markers
     assert "Directory listing" in body
     assert 'id="drop"' in body
+    assert 'id="upload-queue"' in body
+    assert 'id="upload-task-list"' in body
+    assert 'data-task-list' in body
     assert 'id="mkdir"' in body
     assert 'id="show-hidden"' in body
     assert "/_api/mkdir" in body
@@ -137,6 +140,14 @@ def test_directory_listing_html_contains_modern_markup(server):
     assert 'data-sort="mtime"' in body
     assert "function sortEntries(entries)" in body
     assert "applySort(this.getAttribute('data-sort'))" in body
+    assert "等待中" in body
+    assert "进行中" in body
+    assert "已完成" in body
+    assert "失败" in body
+    assert "已取消" in body
+    assert "data-task-status" in body
+    assert "draggable = true" in body
+    assert "服务端可能已写入部分文件" in body
     assert "taskLabel.innerHTML" not in body
     assert "document.createElement('li')" in body
     assert "addEventListener('click', refreshListing)" in body
