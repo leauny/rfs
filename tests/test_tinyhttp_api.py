@@ -5,6 +5,8 @@ soft-delete behavior, and download integrity with `X-Content-MD5`.
 """
 
 import hashlib
+import threading
+import time
 from pathlib import Path
 
 import requests
@@ -145,3 +147,109 @@ def test_path_traversal_blocked(server):
     resp = requests.delete(server.url + "/../should_not_appear.txt")
     assert resp.status_code in (403, 404)
     assert not parent_marker.exists()
+
+
+# ─── /_api/tasks: running-task indicator ────────────────────────────────────
+
+def _tasks(server):
+    return requests.get(server.url + "/_api/tasks", timeout=10).json()
+
+
+def test_tasks_empty_when_idle(server):
+    data = _tasks(server)
+    assert data["ok"] is True
+    assert data["tasks"] == []
+
+
+def test_upload_appears_in_tasks_while_running(server):
+    filename = "big.bin"
+    chunk = b"x" * (256 * 1024)              # 256 KiB
+    chunks = 16                              # ~4 MiB total payload
+    boundary = "testboundary123"
+    head = (
+        b"--" + boundary.encode() + b"\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="'
+        + filename.encode() + b'"\r\n'
+        b"Content-Type: application/octet-stream\r\n\r\n"
+    )
+    tail = b"\r\n--" + boundary.encode() + b"--\r\n"
+
+    def body():
+        yield head
+        for _ in range(chunks):
+            time.sleep(0.08)                # slow producer → server stays mid-upload
+            yield chunk
+        yield tail
+
+    total_len = len(head) + chunks * len(chunk) + len(tail)
+    result = {}
+
+    def do_upload():
+        result["resp"] = requests.post(
+            server.url + "/",
+            data=body(),
+            headers={
+                "Content-Type": "multipart/form-data; boundary=" + boundary,
+                "Content-Length": str(total_len),
+            },
+            timeout=60,
+        )
+
+    t = threading.Thread(target=do_upload)
+    t.start()
+
+    # Poll until the upload task surfaces (or give up).
+    seen = None
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        tasks = _tasks(server).get("tasks", [])
+        if tasks:
+            seen = tasks
+            break
+        time.sleep(0.1)
+
+    assert seen is not None, "upload task never appeared in /_api/tasks"
+    assert any(
+        tk.get("type") == "upload" and tk.get("filename") == filename for tk in seen
+    ), seen
+
+    t.join(timeout=60)
+    assert not t.is_alive()
+    assert result["resp"].status_code == 200
+
+    # Once finished, the task must be gone (no history kept).
+    assert _tasks(server)["tasks"] == []
+
+
+def test_download_appears_in_tasks_while_running(server):
+    payload = b"y" * (4 * 1024 * 1024)      # 4 MiB
+    server.server_path("dl_big.bin").write_bytes(payload)
+
+    result = {}
+    t = threading.Thread(target=lambda: result.__setitem__(
+        "resp", requests.get(server.url + "/dl_big.bin", stream=True, timeout=60)))
+    t.start()
+
+    seen = None
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        tasks = _tasks(server).get("tasks", [])
+        if tasks:
+            seen = tasks
+            break
+        time.sleep(0.1)
+
+    assert seen is not None, "download task never appeared in /_api/tasks"
+    assert any(
+        tk.get("type") == "download" and tk.get("filename") == "dl_big.bin"
+        for tk in seen
+    ), seen
+
+    # Drain and finish the download so the task is cleared.
+    resp = result["resp"]
+    assert resp.status_code == 200
+    assert resp.content == payload
+    t.join(timeout=30)
+    assert not t.is_alive()
+    assert _tasks(server)["tasks"] == []
+

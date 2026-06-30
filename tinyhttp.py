@@ -12,10 +12,12 @@ import re
 import shutil
 import socketserver
 import string
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from io import BytesIO
 
 
@@ -25,6 +27,39 @@ if ThreadingHTTPServer is None:
     class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         daemon_threads = True
         allow_reuse_address = True
+
+
+class TaskRegistry:
+    """Thread-safe in-memory registry of in-flight upload/download tasks.
+
+    Purely in-memory: nothing is persisted, so a process restart clears all
+    state. Only running tasks are kept; finish() removes them. Used to answer
+    "is anything transferring right now?" (e.g. before restarting the server).
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._tasks = {}  # id -> task dict (running only)
+
+    def add(self, task):
+        """Register a running task. `task` is taken by reference; returns its id."""
+        tid = task.get("id") or uuid.uuid4().hex
+        task["id"] = tid
+        with self._lock:
+            self._tasks[tid] = task
+        return tid
+
+    def finish(self, tid):
+        """Remove a finished/failed task. No-op if already gone."""
+        if not tid:
+            return
+        with self._lock:
+            self._tasks.pop(tid, None)
+
+    def list(self):
+        """Snapshot of currently running tasks."""
+        with self._lock:
+            return list(self._tasks.values())
 
 
 # Directory listing template. Uses string.Template to keep it readable while
@@ -41,6 +76,15 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   .crumbs { color: #888; font-size: 13px; margin-bottom: 16px; }
   .crumbs a.parent { color: #06c; text-decoration: none; margin-left: 6px; }
   .crumbs a.parent:hover { text-decoration: underline; }
+  .indicator { font-size: 13px; padding: 8px 12px; border-radius: 6px; margin-bottom: 16px; display: flex; align-items: center; gap: 6px; }
+  .indicator.idle { background: #f3fbf6; color: #2a7; border: 1px solid #cdeedd; }
+  .indicator.busy { background: #fff7ed; color: #b3591a; border: 1px solid #f3d7b3; }
+  .indicator.unknown { background: #f6f8fa; color: #888; border: 1px solid #e1e4e8; }
+  .indicator #task-label { min-width: 0; }
+  .indicator .files { margin: 4px 0 0; padding: 0; color: inherit; }
+  .indicator .files li { list-style: none; }
+  .indicator .task-refresh { margin-left: auto; border: 1px solid currentColor; background: transparent; color: inherit; border-radius: 4px; padding: 1px 7px; cursor: pointer; font-size: 13px; line-height: 1.4; opacity: .7; }
+  .indicator .task-refresh:hover { opacity: 1; }
   .toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
   .toolbar .spacer { flex: 1; }
   .toolbar button { border: 1px solid #ccd2d8; border-radius: 6px; background: #fff; padding: 6px 10px; cursor: pointer; }
@@ -75,6 +119,7 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
 <body>
   <h2>$display_path</h2>
   <div class="crumbs">Directory listing $parent_link</div>
+  <div id="task-indicator" class="indicator unknown"><div id="task-label">检查任务状态…</div><button id="task-refresh" type="button" class="task-refresh" title="立即刷新">↻</button></div>
   <div class="toolbar"><input id="search" type="search" placeholder="搜索文件…"><div class="spacer"></div><button id="refresh" type="button">刷新</button><button id="mkdir" type="button">新建文件夹</button></div>
 
   <div id="drop" class="drop">
@@ -210,7 +255,7 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
         pb.style.width = '100%';
         meta.textContent = uploadName + ' · 完成 · 平均 ' + fmt(avg) + '/s' + (md5 ? ' · MD5 ' + md5 : '');
         if (queue.length) pump();
-        else { setDropState(false); setTimeout(function () { location.reload(); }, 500); }
+        else { setDropState(false); setTimeout(refreshListing, 500); }
       } else {
         meta.textContent = '上传失败 (' + xhr.status + '): ' + uploadName;
         if (queue.length) pump(); else setDropState(false);
@@ -225,23 +270,84 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
     xhr.send(fd);
   }
 
-  function loadRemoteEntries(cb) {
-    if (remoteEntries) { cb(remoteEntries); return; }
+  function entryMapFromList(list) {
+    var entries = {};
+    list.forEach(function (entry) { entries[entry.name] = entry.type === 'dir'; });
+    return entries;
+  }
+
+  function fetchRemoteEntries(cb) {
     var xhr = new XMLHttpRequest();
     xhr.open('GET', apiUrl('/_api/ls') + '?path=' + encodeURIComponent(remotePath()), true);
     xhr.onload = function () {
-      var entries = {};
       if (xhr.status >= 200 && xhr.status < 300) {
         try {
           var data = JSON.parse(xhr.responseText);
-          if (data.ok) data.entries.forEach(function (entry) { entries[entry.name] = entry.type === 'dir'; });
+          if (data.ok) {
+            remoteEntries = entryMapFromList(data.entries);
+            cb(data.entries);
+            return;
+          }
         } catch (e) {}
       }
-      remoteEntries = entries;
-      cb(entries);
+      remoteEntries = remoteEntries || {};
+      cb(null);
     };
-    xhr.onerror = function () { remoteEntries = {}; cb(remoteEntries); };
+    xhr.onerror = function () { remoteEntries = remoteEntries || {}; cb(null); };
     xhr.send();
+  }
+
+  function loadRemoteEntries(cb) {
+    if (remoteEntries) { cb(remoteEntries); return; }
+    fetchRemoteEntries(function () { cb(remoteEntries || {}); });
+  }
+
+  function renderListing(entries) {
+    clearNode(tbody);
+    if (!entries || !entries.length) {
+      var emptyRow = document.createElement('tr');
+      var emptyCell = document.createElement('td');
+      emptyCell.className = 'empty';
+      emptyCell.colSpan = 3;
+      emptyCell.textContent = '— 空目录 —';
+      emptyRow.appendChild(emptyCell);
+      tbody.appendChild(emptyRow);
+      return;
+    }
+    entries.forEach(function (entry) {
+      var row = document.createElement('tr');
+      var nameCell = document.createElement('td');
+      var sizeCell = document.createElement('td');
+      var mtimeCell = document.createElement('td');
+      var link = document.createElement('a');
+      var isDir = entry.type === 'dir';
+      nameCell.className = 'name';
+      sizeCell.className = 'size';
+      mtimeCell.className = 'mtime';
+      link.href = encodeURIComponent(entry.name) + (isDir ? '/' : '');
+      link.textContent = entry.name + (isDir ? '/' : '');
+      nameCell.appendChild(link);
+      sizeCell.textContent = isDir ? '—' : fmt(entry.size || 0);
+      mtimeCell.textContent = isDir || !entry.mtime
+        ? '—'
+        : new Date(entry.mtime * 1000).toISOString().slice(0, 16).replace('T', ' ');
+      row.appendChild(nameCell);
+      row.appendChild(sizeCell);
+      row.appendChild(mtimeCell);
+      tbody.appendChild(row);
+    });
+  }
+
+  function refreshListing() {
+    fetchRemoteEntries(function (entries) {
+      if (!entries) {
+        meta.textContent = '刷新列表失败';
+        return;
+      }
+      renderListing(entries);
+      meta.textContent = '列表已刷新';
+      searchInput.dispatchEvent(new Event('input'));
+    });
   }
 
   function joinRemotePath(name) {
@@ -281,7 +387,7 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
       if (xhr.status >= 200 && xhr.status < 300) {
         if (remoteEntries) remoteEntries[name] = true;
         meta.textContent = '已创建文件夹：' + name;
-        setTimeout(function () { location.reload(); }, 300);
+        setTimeout(refreshListing, 300);
       } else {
         var err = '创建文件夹失败 (' + xhr.status + ')';
         try { err += ': ' + (JSON.parse(xhr.responseText).error || ''); } catch (e) {}
@@ -345,7 +451,7 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   }
 
   mkdirBtn.addEventListener('click', createDirectory);
-  document.getElementById('refresh').addEventListener('click', function () { location.reload(); });
+  document.getElementById('refresh').addEventListener('click', refreshListing);
   var searchInput = document.getElementById('search');
   var tbody = document.querySelector('table tbody');
   searchInput.addEventListener('input', function () {
@@ -372,6 +478,66 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
       add(e.dataTransfer.files);
     }
   });
+
+  // ── Running-task indicator (polls /_api/tasks every 5s) ──
+  var indicator = document.getElementById('task-indicator');
+  var taskLabel = document.getElementById('task-label');
+  var pollTimer = null;
+
+  function clearNode(node) {
+    while (node.firstChild) node.removeChild(node.firstChild);
+  }
+
+  function renderTasks(tasks) {
+    if (!tasks.length) {
+      indicator.className = 'indicator idle';
+      taskLabel.textContent = '✓ 空闲，可安全重启';
+      return;
+    }
+    indicator.className = 'indicator busy';
+    clearNode(taskLabel);
+    taskLabel.appendChild(document.createTextNode('⚠ ' + tasks.length + ' 个任务进行中，请勿重启'));
+    var list = document.createElement('ul');
+    list.className = 'files';
+    tasks.forEach(function (t) {
+      var item = document.createElement('li');
+      var arrow = t.type === 'upload' ? '↑' : '↓';
+      item.textContent = arrow + ' ' + (t.filename || t.path || '(unknown)');
+      list.appendChild(item);
+    });
+    taskLabel.appendChild(list);
+  }
+
+  function pollTasks() {
+    return fetch(apiUrl('/_api/tasks'), { cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data && data.ok) renderTasks(data.tasks || []);
+        else { indicator.className = 'indicator unknown'; taskLabel.textContent = '任务状态不可用'; }
+      })
+      .catch(function () {
+        indicator.className = 'indicator unknown';
+        taskLabel.textContent = '无法连接服务器';
+      });
+  }
+
+  document.getElementById('task-refresh').addEventListener('click', function () {
+    this.blur();   // drop focus so the button matches the auto-refresh appearance
+    pollTasks();
+  });
+
+  function startPolling() {
+    if (pollTimer) return;
+    pollTasks();
+    pollTimer = setInterval(pollTasks, 5000);
+  }
+  function stopPolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) stopPolling(); else startPolling();
+  });
+  startPolling();
 })();
 </script>
 </body>
@@ -408,11 +574,38 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             return self._api_trash(parsed)
         if parsed.path == "/_api/stat":
             return self._api_stat(parsed)
+        if parsed.path == "/_api/tasks":
+            return self._api_tasks()
 
-        f = self.send_head()
-        if f:
-            self.copyfile(f, self.wfile)
-            f.close()
+        # Register the download task *before* send_head: send_head computes
+        # X-Content-MD5 by reading the whole file, which for large files blocks
+        # for a while. That phase must be covered by the "busy" indicator too,
+        # otherwise the panel would falsely show "safe to restart" mid-download.
+        reg = getattr(self.server, "task_registry", None)
+        tid = None
+        if reg:
+            pre_path = self.translate_path(parsed.path)
+            if os.path.isfile(pre_path):
+                tid = reg.add({
+                    "type": "download",
+                    "path": parsed.path,
+                    "filename": os.path.basename(parsed.path.rstrip("/")) or parsed.path,
+                    "client_ip": self.client_address[0],
+                    "started_at": time.time(),
+                })
+        try:
+            f = self.send_head()
+            if f:
+                try:
+                    self.copyfile(f, self.wfile)
+                except (BrokenPipeError, ConnectionResetError):
+                    # Client disconnected mid-download; task is over either way.
+                    pass
+                finally:
+                    f.close()
+        finally:
+            if reg and tid:
+                reg.finish(tid)
 
     def do_HEAD(self):
         parsed = self._parse_prefixed_path()
@@ -571,6 +764,12 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             "mtime": st.st_mtime,
         }
         return self._send_json(200, {"ok": True, "stat": info})
+
+    def _api_tasks(self):
+        """GET /_api/tasks — Snapshot of currently running upload/download tasks."""
+        reg = getattr(self.server, "task_registry", None)
+        tasks = reg.list() if reg else []
+        return self._send_json(200, {"ok": True, "tasks": tasks})
 
     def _api_trash(self, parsed):
         """GET /_api/trash?dir=/path/ — List trashed files for a directory."""
@@ -844,62 +1043,75 @@ class SimpleHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
 
         path = self.translate_path(parsed.path)
         filepath = os.path.join(path, filename)
-        params = urllib.parse.parse_qs(parsed.query)
-        overwrite = params.get("overwrite", ["0"])[0] == "1"
-        if os.path.isdir(filepath):
-            return (False, "A directory with this name already exists", None, None)
-        if os.path.exists(filepath) and not overwrite:
-            return (False, "File already exists", None, None)
 
-        # ─── Phase 2: stream the body to disk, hashing on the fly
-        leftover = buf[header_end + 4:]
-        del buf
-        h = hashlib.md5()
-        # Always keep at least len(end_sep)+4 bytes back so a boundary that
-        # straddles two reads is never accidentally written to the file.
-        tail_keep = len(end_sep) + 4
-
+        reg = getattr(self.server, "task_registry", None)
+        tid = reg.add({
+            "type": "upload",
+            "path": parsed.path,
+            "filename": filename,
+            "client_ip": self.client_address[0],
+            "started_at": time.time(),
+        }) if reg else None
         try:
-            out = open(filepath, 'wb')
-        except IOError:
-            return (False, "Can't create file to write, do you have permission to write?", None, None)
+            params = urllib.parse.parse_qs(parsed.query)
+            overwrite = params.get("overwrite", ["0"])[0] == "1"
+            if os.path.isdir(filepath):
+                return (False, "A directory with this name already exists", None, None)
+            if os.path.exists(filepath) and not overwrite:
+                return (False, "File already exists", None, None)
 
-        try:
-            with out:
-                window = leftover
-                while True:
-                    idx = window.find(end_sep)
-                    if idx != -1:
-                        out.write(window[:idx])
-                        h.update(window[:idx])
-                        break
-                    if len(window) > tail_keep:
-                        flush = window[:-tail_keep]
-                        out.write(flush)
-                        h.update(flush)
-                        window = window[-tail_keep:]
-                    if remaining[0] <= 0:
-                        # Stream exhausted without finding the closing boundary;
-                        # flush whatever's left (best-effort, rare for valid clients).
-                        if window:
-                            out.write(window)
-                            h.update(window)
-                        break
-                    chunk = read_some(READ)
-                    if not chunk:
-                        if window:
-                            out.write(window)
-                            h.update(window)
-                        break
-                    window += chunk
-        except IOError as e:
+            # ─── Phase 2: stream the body to disk, hashing on the fly
+            leftover = buf[header_end + 4:]
+            del buf
+            h = hashlib.md5()
+            # Always keep at least len(end_sep)+4 bytes back so a boundary that
+            # straddles two reads is never accidentally written to the file.
+            tail_keep = len(end_sep) + 4
+
             try:
-                os.remove(filepath)
-            except OSError:
-                pass
-            return (False, "Write failed: %s" % e, None, None)
+                out = open(filepath, 'wb')
+            except IOError:
+                return (False, "Can't create file to write, do you have permission to write?", None, None)
 
-        return (True, "File '%s' upload success!" % filepath, filepath, h.hexdigest())
+            try:
+                with out:
+                    window = leftover
+                    while True:
+                        idx = window.find(end_sep)
+                        if idx != -1:
+                            out.write(window[:idx])
+                            h.update(window[:idx])
+                            break
+                        if len(window) > tail_keep:
+                            flush = window[:-tail_keep]
+                            out.write(flush)
+                            h.update(flush)
+                            window = window[-tail_keep:]
+                        if remaining[0] <= 0:
+                            # Stream exhausted without finding the closing boundary;
+                            # flush whatever's left (best-effort, rare for valid clients).
+                            if window:
+                                out.write(window)
+                                h.update(window)
+                            break
+                        chunk = read_some(READ)
+                        if not chunk:
+                            if window:
+                                out.write(window)
+                                h.update(window)
+                            break
+                        window += chunk
+            except IOError as e:
+                try:
+                    os.remove(filepath)
+                except OSError:
+                    pass
+                return (False, "Write failed: %s" % e, None, None)
+
+            return (True, "File '%s' upload success!" % filepath, filepath, h.hexdigest())
+        finally:
+            if reg and tid:
+                reg.finish(tid)
 
     def send_head(self):
         parsed = self._parse_prefixed_path()
@@ -1072,6 +1284,7 @@ if __name__ == '__main__':
         (args.bind, args.port), SimpleHTTPRequestHandler
     )
     server.url_prefix = url_prefix
+    server.task_registry = TaskRegistry()
     prefix_text = f" with URL prefix {url_prefix}" if url_prefix else ""
     print(f"Serving on {args.bind}:{args.port}{prefix_text} (threaded) ...")
     try:

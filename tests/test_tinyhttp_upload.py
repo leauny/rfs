@@ -131,6 +131,10 @@ def test_directory_listing_html_contains_modern_markup(server):
     assert 'id="mkdir"' in body
     assert "/_api/mkdir" in body
     assert "FormData" in body
+    assert "taskLabel.innerHTML" not in body
+    assert "document.createElement('li')" in body
+    assert "addEventListener('click', refreshListing)" in body
+    assert "setTimeout(function () { location.reload(); }" not in body
     # No remnants of the old <ul> markup
     assert "<ul>" not in body
 
