@@ -135,6 +135,9 @@ def test_directory_listing_html_contains_modern_markup(server):
     assert "document.createElement('li')" in body
     assert "addEventListener('click', refreshListing)" in body
     assert "setTimeout(function () { location.reload(); }" not in body
+    assert 'id="toast"' in body
+    assert "showToast('刷新列表失败')" in body
+    assert "列表已刷新" not in body
     # No remnants of the old <ul> markup
     assert "<ul>" not in body
 

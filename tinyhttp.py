@@ -85,6 +85,8 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   .indicator .files li { list-style: none; }
   .indicator .task-refresh { margin-left: auto; border: 1px solid currentColor; background: transparent; color: inherit; border-radius: 4px; padding: 1px 7px; cursor: pointer; font-size: 13px; line-height: 1.4; opacity: .7; }
   .indicator .task-refresh:hover { opacity: 1; }
+  .toast { position: fixed; top: 18px; right: 18px; max-width: 320px; padding: 10px 12px; border-radius: 6px; background: #222; color: #fff; box-shadow: 0 8px 24px rgba(0,0,0,.18); opacity: 0; pointer-events: none; transform: translateY(-8px); transition: opacity .18s, transform .18s; z-index: 10; }
+  .toast.show { opacity: 1; transform: translateY(0); }
   .toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
   .toolbar .spacer { flex: 1; }
   .toolbar button { border: 1px solid #ccd2d8; border-radius: 6px; background: #fff; padding: 6px 10px; cursor: pointer; }
@@ -121,6 +123,7 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   <div class="crumbs">Directory listing $parent_link</div>
   <div id="task-indicator" class="indicator unknown"><div id="task-label">检查任务状态…</div><button id="task-refresh" type="button" class="task-refresh" title="立即刷新">↻</button></div>
   <div class="toolbar"><input id="search" type="search" placeholder="搜索文件…"><div class="spacer"></div><button id="refresh" type="button">刷新</button><button id="mkdir" type="button">新建文件夹</button></div>
+  <div id="toast" class="toast" role="alert" aria-live="polite"></div>
 
   <div id="drop" class="drop">
     <span id="drop-idle">拖拽文件到此处，或 <label>点击选择<input id="file" type="file" multiple hidden></label></span>
@@ -162,6 +165,8 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   var cancelBtn = document.getElementById('cancel');
   var dropIdle = document.getElementById('drop-idle');
   var dropBusy = document.getElementById('drop-busy');
+  var toast = document.getElementById('toast');
+  var toastTimer = null;
   var queue = [], busy = false, remoteEntries = null;
 
   function setDropState(uploading) {
@@ -196,6 +201,16 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
     if (m || h || d) r += m + 'm';
     r += s + 's';
     return r;
+  }
+
+  function showToast(message) {
+    if (toastTimer) clearTimeout(toastTimer);
+    toast.textContent = message;
+    toast.classList.add('show');
+    toastTimer = setTimeout(function () {
+      toast.classList.remove('show');
+      toastTimer = null;
+    }, 3500);
   }
 
   function apiUrl(path) {
@@ -341,11 +356,10 @@ _DIR_TEMPLATE = string.Template("""<!DOCTYPE html>
   function refreshListing() {
     fetchRemoteEntries(function (entries) {
       if (!entries) {
-        meta.textContent = '刷新列表失败';
+        showToast('刷新列表失败');
         return;
       }
       renderListing(entries);
-      meta.textContent = '列表已刷新';
       searchInput.dispatchEvent(new Event('input'));
     });
   }
